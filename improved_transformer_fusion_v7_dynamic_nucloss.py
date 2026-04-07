@@ -1,19 +1,35 @@
-# nohup python3 -u improved_transformer_fusion_v7_dynamic_nucloss.py > train_v7_dynamic_nuc.txt 2>&1 &
+import argparse
 import os
+import random
+
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from pytorch_msssim import ssim
-import numpy as np
 from PIL import Image
-import gc
-import random
-import cv2
+from pytorch_msssim import ssim
+from torch.utils.data import DataLoader, Dataset
+
 cv2.setNumThreads(0)
-cv2.ocl.setUseOpenCL(False) # Also disable OpenCL to be safe
-random.seed(42) # Added seed for reproducibility
+cv2.ocl.setUseOpenCL(False)
+
+
+def seed_everything(seed: int = 42):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Fixed-size inputs benefit from benchmark autotuning.
+    torch.backends.cudnn.benchmark = True
+
+
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 # -------------------------------------------------------------
 # 1. Model Components: Cross-Attention + Spatial Reduction
 # -------------------------------------------------------------
@@ -37,15 +53,17 @@ class CrossSRA(nn.Module):
     def forward(self, x_vis, x_ir, H, W):
         B, N, C = x_vis.shape
         q = self.q(x_vis).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        
+
         # Keys and Values from Infrared (Reduced spatially to save VRAM)
         x_ir_spatial = x_ir.permute(0, 2, 1).reshape(B, C, H, W)
         if self.sr_ratio > 1:
-            x_ir_spatial = self.sr(x_ir_spatial).reshape(B, C, -1).permute(0, 2, 1)
-            x_ir_spatial = self.norm(x_ir_spatial)
-        
-        k = self.k(x_ir_spatial).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        v = self.v(x_ir_spatial).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            x_ir_tokens = self.sr(x_ir_spatial).flatten(2).transpose(1, 2)
+            x_ir_tokens = self.norm(x_ir_tokens)
+        else:
+            x_ir_tokens = x_ir_spatial.flatten(2).transpose(1, 2)
+
+        k = self.k(x_ir_tokens).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v(x_ir_tokens).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -69,9 +87,10 @@ class SourceFocusFusionNet(nn.Module):
         v_f, i_f = v3.flatten(2).transpose(1, 2), i3.flatten(2).transpose(1, 2)
         f_f = v_f + self.bridge(v_f, i_f, H, W)
         f3 = f_f.transpose(1, 2).reshape(B, C, H, W)
-        d3 = F.interpolate(F.relu(self.dec[0](f3)), scale_factor=2)
-        d2 = F.interpolate(F.relu(self.dec[1](d3)), scale_factor=2)
-        out = torch.sigmoid(self.dec[2](F.interpolate(d2, scale_factor=2)))
+        d3 = F.interpolate(F.relu(self.dec[0](f3)), scale_factor=2, mode="bilinear", align_corners=False)
+        d2 = F.interpolate(F.relu(self.dec[1](d3)), scale_factor=2, mode="bilinear", align_corners=False)
+        d1 = F.interpolate(d2, scale_factor=2, mode="bilinear", align_corners=False)
+        out = torch.sigmoid(self.dec[2](d1))
         return out, v3, i3, f3
 
 # -------------------------------------------------------------
@@ -92,7 +111,7 @@ class SourceFocusLoss(nn.Module):
         return torch.sqrt(gx**2 + gy**2 + 1e-6)
 
     def nuclear_norm(self, x):
-        flattened = x.view(x.size(0), x.size(1), -1)
+        flattened = x.float().reshape(x.size(0), x.size(1), -1)
         return torch.linalg.norm(flattened, ord='nuc', dim=(1, 2)).mean()
 
     def forward(self, fused, vis, ir, gt, v_feat, i_feat, f_feat):
@@ -130,6 +149,7 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience: self.early_stop = True
 
+
 class FusionDataset(Dataset):
     def __init__(self, v_path, i_path, g_path, files, clahe_prob=0.5):
         self.v_path = v_path
@@ -142,7 +162,12 @@ class FusionDataset(Dataset):
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
         # Standardize transform pipeline
-        self.transform = transforms.Compose([
+        self.rgb_transform = transforms.Compose([
+            transforms.Resize((512, 512)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        self.ir_transform = transforms.Compose([
             transforms.Resize((512, 512)),
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))
@@ -191,90 +216,194 @@ class FusionDataset(Dataset):
                     gt = self.apply_clahe(gt)
 
                 # 3. Transformations
-                vis_tensor = self.transform(vis)
-                ir_tensor = self.transform(ir)
-                gt_tensor = self.transform(gt)
+                vis_tensor = self.rgb_transform(vis)
+                ir_tensor = self.ir_transform(ir)
+                gt_tensor = self.rgb_transform(gt)
 
                 return vis_tensor, ir_tensor, gt_tensor, f_name
-        
+
         except Exception as e:
             print(f"Error loading {f_name}: {e}")
-            # Return a zero tensor or skip in case of corruption
-            return torch.zeros(3, 512, 512), torch.zeros(1, 512, 512), torch.zeros(3, 512, 512), f_name
+            # Skip corrupt samples instead of injecting zero-images.
+            return None
+
+
+def collate_skip_none(batch):
+    batch = [sample for sample in batch if sample is not None]
+    if not batch:
+        return None
+    vis, ir, gt, names = zip(*batch)
+    return torch.stack(vis), torch.stack(ir), torch.stack(gt), names
 
 # -------------------------------------------------------------
 # 4. Main Training Logic
 # -------------------------------------------------------------
 
-def main():
+def main(train_loader, val_loader, model_path, epochs=100, lr=1e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
     model = SourceFocusFusionNet().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     criterion = SourceFocusLoss().to(device)
-    
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    early_stop = EarlyStopping(patience=12)
+    early_stop = EarlyStopping(patience=12, path=model_path)
 
-    
-    # Note: Define your train_loader and val_loader before this block
-    for epoch in range(100):
-        model.train(); train_l = 0
-        for vis, ir, gt, _ in train_loader:
-            vis, ir, gt = vis.to(device), ir.to(device), gt.to(device)
-            
-            fused, v_f, i_f, f_f = model(vis, ir)
-            
-            # Loss Calculation (Normalization to [0,1] for SSIM/Grad logic)
-            loss = criterion(fused, (vis+1)/2, (ir+1)/2, (gt+1)/2, v_f, i_f, f_f)
-            
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            train_l += loss.item()
+    for epoch in range(epochs):
+        model.train(); train_l = 0.0; train_steps = 0
+        for batch in train_loader:
+            if batch is None:
+                continue
 
-        model.eval(); val_l = 0
-        with torch.no_grad():
-            for vis, ir, gt, _ in val_loader:
-                vis, ir, gt = vis.to(device), ir.to(device), gt.to(device)
+            vis, ir, gt, _ = batch
+            vis = vis.to(device, non_blocking=True)
+            ir = ir.to(device, non_blocking=True)
+            gt = gt.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 fused, v_f, i_f, f_f = model(vis, ir)
-                val_l += criterion(fused, (vis+1)/2, (ir+1)/2, (gt+1)/2, v_f, i_f, f_f).item()
-        
-        avg_v_loss = val_l / len(val_loader)
-        print(f"Epoch {epoch+1} | Train Loss: {train_l/len(train_loader):.4f} | Val Loss: {avg_v_loss:.4f}")
-        
+                # Loss Calculation (Normalization to [0,1] for SSIM/Grad logic)
+                loss = criterion(fused, (vis + 1) / 2, (ir + 1) / 2, (gt + 1) / 2, v_f, i_f, f_f)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            train_l += loss.item()
+            train_steps += 1
+
+        if train_steps == 0:
+            raise RuntimeError("No valid training batches were produced. Check dataset integrity.")
+
+        model.eval(); val_l = 0.0; val_steps = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                if batch is None:
+                    continue
+
+                vis, ir, gt, _ = batch
+                vis = vis.to(device, non_blocking=True)
+                ir = ir.to(device, non_blocking=True)
+                gt = gt.to(device, non_blocking=True)
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    fused, v_f, i_f, f_f = model(vis, ir)
+                    val_loss = criterion(fused, (vis + 1) / 2, (ir + 1) / 2, (gt + 1) / 2, v_f, i_f, f_f)
+
+                val_l += val_loss.item()
+                val_steps += 1
+
+        if val_steps == 0:
+            raise RuntimeError("No valid validation batches were produced. Check validation split/data.")
+
+        avg_t_loss = train_l / train_steps
+        avg_v_loss = val_l / val_steps
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch + 1} | LR: {current_lr:.2e} | Train Loss: {avg_t_loss:.4f} | Val Loss: {avg_v_loss:.4f}")
+
         scheduler.step(avg_v_loss)
         early_stop(avg_v_loss, model)
-        if early_stop.early_stop: 
+        if early_stop.early_stop:
             print("🛑 Early Stopping Triggered.")
             break
-        
-        torch.cuda.empty_cache(); gc.collect()
 
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Source-focus VIS/IR fusion training")
+    parser.add_argument("--v-dir", default="/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/vi")
+    parser.add_argument("--i-dir", default="/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/ir")
+    parser.add_argument("--g-dir", default="/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/SGT_Direct_Fusion")
+    parser.add_argument("--model-path", default="/home/chandra/Documents/Mizzou/outputs_100epochs/v7_dynamic.pth")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--train-split", type=float, default=0.8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--clahe-prob", type=float, default=0.5)
+    return parser
+
+def validate_dirs(*paths):
+    for path in paths:
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Directory not found: {path}")
 
 
 if __name__ == "__main__":
-    # ... (Your path and directory setup remains the same) ...
-    V_DIR = '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/vi'
-    I_DIR = '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/ir'
-    G_DIR = '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/SGT_Direct_Fusion'
+    args = build_arg_parser().parse_args()
+    seed_everything(args.seed)
 
-    ATTN_DIR = '/home/chandra/Documents/Mizzou/outputs_100epochs/attention_maps'
-    PLOT_DIR = '/home/chandra/Documents/Mizzou/outputs_100epochs/plots'
-    SAMPLE_DIR = '/home/chandra/Documents/Mizzou/outputs_100epochs/fused_samples'
-    MODEL_PATH = '/home/chandra/Documents/Mizzou/outputs_100epochs/v7_dynamic.pth'
-    # 1. Get files and split
-    files = sorted([f for f in os.listdir(V_DIR) if f.endswith(('.png', '.jpg'))])
-    
+    validate_dirs(args.v_dir, args.i_dir, args.g_dir)
+
+    valid_ext = (".png", ".jpg", ".jpeg")
+    files = []
+    for f in sorted(os.listdir(args.v_dir)):
+        if not f.lower().endswith(valid_ext):
+            continue
+        i_path = os.path.join(args.i_dir, f)
+        g_path = os.path.join(args.g_dir, f)
+        if os.path.isfile(i_path) and os.path.isfile(g_path):
+            files.append(f)
+
+    if len(files) < 2:
+        raise RuntimeError("Need at least 2 matched files across vis/ir/gt folders.")
+
     random.shuffle(files)
-    split = int(0.8 * len(files))
-    
-    # 2. Create Loaders (Note: I kept batch_size=4 as you defined, but watch for OOM)
-    train_loader = DataLoader(FusionDataset(V_DIR, I_DIR, G_DIR, files[:split], 0.5), 
-                              batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(FusionDataset(V_DIR, I_DIR, G_DIR, files[split:], 0.0), 
-                            batch_size=4, num_workers=2)
-    
-    print("🚀 Starting V10 Source-Focus Training...")
-    
-    # --- CRITICAL FIX: UNCOMMENT THIS LINE ---
-    main() 
-    
+    split = int(args.train_split * len(files))
+    split = max(1, min(split, len(files) - 1))
+    train_files = files[:split]
+    val_files = files[split:]
+
+    print(f"Found {len(files)} matched samples | Train: {len(train_files)} | Val: {len(val_files)}")
+
+    pin_memory = torch.cuda.is_available()
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
+
+    train_loader_kwargs = dict(
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_skip_none,
+        worker_init_fn=seed_worker,
+        generator=loader_generator,
+        persistent_workers=args.num_workers > 0,
+    )
+    val_loader_kwargs = dict(
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_skip_none,
+        worker_init_fn=seed_worker,
+        generator=loader_generator,
+        persistent_workers=args.num_workers > 0,
+    )
+    if args.num_workers > 0:
+        train_loader_kwargs["prefetch_factor"] = 2
+        val_loader_kwargs["prefetch_factor"] = 2
+
+    train_loader = DataLoader(
+        FusionDataset(args.v_dir, args.i_dir, args.g_dir, train_files, args.clahe_prob),
+        **train_loader_kwargs,
+    )
+    val_loader = DataLoader(
+        FusionDataset(args.v_dir, args.i_dir, args.g_dir, val_files, 0.0),
+        **val_loader_kwargs,
+    )
+
+    model_dir = os.path.dirname(args.model_path)
+    if model_dir:
+        os.makedirs(model_dir, exist_ok=True)
+
+    print("🚀 Starting Source-Focus training...")
+    main(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        model_path=args.model_path,
+        epochs=args.epochs,
+        lr=args.lr,
+    )
     print("✅ Training Finished.")
