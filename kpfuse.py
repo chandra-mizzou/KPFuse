@@ -254,7 +254,7 @@ class Loss(nn.Module):
         w_sp: float = 0.08,
     ):
         super().__init__()
-        self.sp = SPLoss()
+        self.sp = KeyNetLoss()
         self.sobel = SobelGrad()
         self.w_gt_l1 = w_gt_l1
         self.w_ssim = w_ssim
