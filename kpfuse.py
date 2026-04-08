@@ -108,6 +108,29 @@ class CrossSRA(nn.Module):
         return self.proj(x)
 
 
+class FusionTokenBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, sr: int, mlp_ratio: float = 2.0):
+        super().__init__()
+        self.v2i = CrossSRA(dim, heads=heads, sr=sr)
+        self.i2v = CrossSRA(dim, heads=heads, sr=sr)
+        self.a = nn.Parameter(torch.tensor(0.5))
+        self.b = nn.Parameter(torch.tensor(0.5))
+        hidden = int(dim * mlp_ratio)
+        self.norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, vf, if_, h, w):
+        attn = torch.sigmoid(self.a) * self.v2i(vf, if_, h, w)
+        attn = attn + torch.sigmoid(self.b) * self.i2v(if_, vf, h, w)
+        vf = vf + attn
+        vf = vf + self.ffn(self.norm(vf))
+        return vf
+
+
 def down(ic, oc):
     return nn.Sequential(
         nn.Conv2d(ic, oc, 3, 2, 1), nn.BatchNorm2d(oc), nn.LeakyReLU(0.2, inplace=True)
@@ -129,23 +152,40 @@ def conv(ic, oc):
 
 
 class FusionNet(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        base_ch: int = 32,
+        bottleneck_ch: int = 256,
+        attn_heads: int = 16,
+        attn_sr: int = 4,
+        attn_depth: int = 3,
+        attn_mlp_ratio: float = 2.0,
+    ):
         super().__init__()
-        self.v1, self.v2, self.v3 = down(3, 16), down(16, 32), down(32, 64)
-        self.i1, self.i2, self.i3 = down(1, 16), down(16, 32), down(32, 64)
+        if bottleneck_ch % attn_heads != 0:
+            raise ValueError("bottleneck_ch must be divisible by attn_heads")
 
-        self.v2i = CrossSRA(64)
-        self.i2v = CrossSRA(64)
+        self.v1, self.v2, self.v3 = down(3, base_ch), down(base_ch, base_ch * 2), down(base_ch * 2, bottleneck_ch)
+        self.i1, self.i2, self.i3 = down(1, base_ch), down(base_ch, base_ch * 2), down(base_ch * 2, bottleneck_ch)
 
-        self.a = nn.Parameter(torch.tensor(0.5))
-        self.b = nn.Parameter(torch.tensor(0.5))
+        self.fusion_blocks = nn.ModuleList(
+            [
+                FusionTokenBlock(
+                    dim=bottleneck_ch,
+                    heads=attn_heads,
+                    sr=attn_sr,
+                    mlp_ratio=attn_mlp_ratio,
+                )
+                for _ in range(attn_depth)
+            ]
+        )
 
-        self.up3 = up(64, 32)
-        self.c3 = conv(32 + 32 + 32, 32)
-        self.up2 = up(32, 16)
-        self.c2 = conv(16 + 16 + 16, 16)
-        self.up1 = up(16, 16)
-        self.out = nn.Conv2d(16, 3, 3, 1, 1)
+        self.up3 = up(bottleneck_ch, base_ch * 2)
+        self.c3 = conv((base_ch * 2) + (base_ch * 2) + (base_ch * 2), base_ch * 2)
+        self.up2 = up(base_ch * 2, base_ch)
+        self.c2 = conv(base_ch + base_ch + base_ch, base_ch)
+        self.up1 = up(base_ch, base_ch)
+        self.out = nn.Conv2d(base_ch, 3, 3, 1, 1)
 
     def forward(self, v, i):
         # Correct sequential feature extraction (avoid recomputing blocks).
@@ -161,11 +201,9 @@ class FusionNet(nn.Module):
         vf = v3.flatten(2).transpose(1, 2)
         if_ = i3.flatten(2).transpose(1, 2)
 
-        f = (
-            vf
-            + torch.sigmoid(self.a) * self.v2i(vf, if_, h, w)
-            + torch.sigmoid(self.b) * self.i2v(if_, vf, h, w)
-        )
+        f = vf
+        for block in self.fusion_blocks:
+            f = block(f, if_, h, w)
         f = f.transpose(1, 2).reshape(bsz, c, h, w)
 
         d3 = self.c3(torch.cat([self.up3(f), v2, i2], dim=1))
