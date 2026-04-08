@@ -375,7 +375,14 @@ def train(args):
     )
     print(f"Matched samples: {n_samples} | train batches: {len(tr_loader)} | val batches: {len(vl_loader)}")
 
-    net = FusionNet().to(device)
+    net = FusionNet(
+        base_ch=args.base_ch,
+        bottleneck_ch=args.bottleneck_ch,
+        attn_heads=args.attn_heads,
+        attn_sr=args.attn_sr,
+        attn_depth=args.attn_depth,
+        attn_mlp_ratio=args.attn_mlp_ratio,
+    ).to(device)
     loss_fn = Loss(
         w_gt_l1=args.w_gt_l1,
         w_ssim=args.w_ssim,
@@ -456,6 +463,13 @@ def parse_args():
     p.add_argument("--w-grad", type=float, default=0.7)
     p.add_argument("--w-src-l1", type=float, default=0.25)
     p.add_argument("--w-sp", type=float, default=0.08)
+    # Capacity scaling knobs for higher GPU utilization.
+    p.add_argument("--base-ch", type=int, default=32)
+    p.add_argument("--bottleneck-ch", type=int, default=256)
+    p.add_argument("--attn-heads", type=int, default=16)
+    p.add_argument("--attn-sr", type=int, default=4)
+    p.add_argument("--attn-depth", type=int, default=3)
+    p.add_argument("--attn-mlp-ratio", type=float, default=2.0)
     return p.parse_args()
 
 
