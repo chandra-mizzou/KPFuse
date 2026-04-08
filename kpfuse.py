@@ -175,107 +175,56 @@ class FusionNet(nn.Module):
 
 
 # =========================================================
-# SUPERPOINT + MATCHING LOSS
+# KEYNET RESPONSE LOSS
 # =========================================================
-class SuperPoint(nn.Module):
+class KeyNetResponse(nn.Module):
     def __init__(self):
         super().__init__()
-        self.sp = KF.SuperPoint(pretrained=True)
-        self.sp.eval()
-        for p in self.sp.parameters():
+        try:
+            self.keynet = KF.KeyNet(pretrained=True)
+        except Exception:
+            # Fallback keeps script trainable when pretrained download is unavailable.
+            self.keynet = KF.KeyNet(pretrained=False)
+        self.keynet.eval()
+        for p in self.keynet.parameters():
             p.requires_grad = False
 
     def forward(self, x):
-        out = self.sp(x)
-        if not isinstance(out, dict) or "scores" not in out or "descriptors" not in out:
-            raise RuntimeError("Unexpected SuperPoint output format.")
-        return out["scores"], out["descriptors"]
+        out = self.keynet(x)
+        if isinstance(out, dict):
+            for key in ("response", "scores", "score_map"):
+                if key in out:
+                    out = out[key]
+                    break
+            else:
+                raise RuntimeError("Unexpected KeyNet dict output format.")
+        if out.ndim == 3:
+            out = out.unsqueeze(1)
+        if out.ndim != 4:
+            raise RuntimeError(f"Unexpected KeyNet output shape: {out.shape}")
+        return out
 
 
-class MatchLoss(nn.Module):
-    def forward_dense(self, a, b, c):
-        a = F.normalize(a, p=2, dim=1)
-        b = F.normalize(b, p=2, dim=1)
-        c = F.normalize(c, p=2, dim=1)
-        sim_ab = torch.einsum("bchw,bcij->bhwij", a, b)
-        sim_ac = torch.einsum("bchw,bcij->bhwij", a, c)
-        return F.l1_loss(sim_ac, sim_ab)
-
-    def forward_sparse(self, a, b, c):
-        a = F.normalize(a, p=2, dim=-1)
-        b = F.normalize(b, p=2, dim=-1)
-        c = F.normalize(c, p=2, dim=-1)
-        sim_ab = a @ b.transpose(-1, -2)
-        sim_ac = a @ c.transpose(-1, -2)
-        return F.l1_loss(sim_ac, sim_ab)
-
-
-class SPLoss(nn.Module):
-    def __init__(self, max_sparse_k: int = 512):
+class KeyNetLoss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.sp = SuperPoint()
-        self.match = MatchLoss()
-        self.max_sparse_k = max_sparse_k
-
-    @staticmethod
-    def _as_sparse(scores, desc):
-        # scores: [B, N] ; desc: [B, N, D]
-        if desc.ndim == 3 and desc.shape[1] != scores.shape[1] and desc.shape[2] == scores.shape[1]:
-            desc = desc.transpose(1, 2)
-        return scores, desc
-
-    @staticmethod
-    def _topk(scores, desc, k: int):
-        vals, idx = torch.topk(scores, k=k, dim=1)
-        d = torch.gather(desc, 1, idx.unsqueeze(-1).expand(-1, -1, desc.shape[-1]))
-        return vals, d
+        self.detector = KeyNetResponse()
 
     def forward(self, v, i, f):
+        # Use grayscale responses for VIS/Fused; IR is already single-channel.
         v = v.mean(1, True)
-        i = i
         f = f.mean(1, True)
 
-        # Keep source branches out of autograd to save memory; keep fused branch
-        # differentiable so SP loss contributes gradients to FusionNet.
+        # Source responses as fixed targets; fused response remains differentiable.
         with torch.no_grad():
-            sv, dv = self.sp(v)
-            si, di = self.sp(i)
-        sf, df = self.sp(f)
+            rv = self.detector(v)
+            ri = self.detector(i)
+        rf = self.detector(f)
 
-        # Dense-map mode (older Kornia SuperPoint variants).
-        if sv.ndim == 4 and dv.ndim == 4:
-            if sf.shape[-2:] != sv.shape[-2:]:
-                sf = F.interpolate(sf, size=sv.shape[-2:], mode="bilinear", align_corners=False)
-            if df.shape[-2:] != dv.shape[-2:]:
-                df = F.interpolate(df, size=dv.shape[-2:], mode="bilinear", align_corners=False)
-
-            kp = F.l1_loss(sf, torch.max(sv, si))
-            desc = F.l1_loss(df, (dv + di) / 2)
-            match = self.match.forward_dense(dv, di, df)
-            return kp + desc + match
-
-        # Sparse mode (newer Kornia SuperPoint variants).
-        if sv.ndim == 2 and dv.ndim == 3:
-            sv, dv = self._as_sparse(sv, dv)
-            si, di = self._as_sparse(si, di)
-            sf, df = self._as_sparse(sf, df)
-
-            k = min(self.max_sparse_k, sv.shape[1], si.shape[1], sf.shape[1])
-            if k < 8:
-                return v.new_tensor(0.0)
-
-            sv, dv = self._topk(sv, dv, k)
-            si, di = self._topk(si, di, k)
-            sf, df = self._topk(sf, df, k)
-
-            kp = F.l1_loss(sf, torch.max(sv, si))
-            desc = F.l1_loss(df, (dv + di) / 2)
-            match = self.match.forward_sparse(dv, di, df)
-            return kp + desc + match
-
-        raise RuntimeError(
-            f"Unsupported SuperPoint shapes: scores={sv.shape}, descriptors={dv.shape}"
-        )
+        if rf.shape[-2:] != rv.shape[-2:]:
+            rf = F.interpolate(rf, size=rv.shape[-2:], mode="bilinear", align_corners=False)
+        target = torch.max(rv, ri)
+        return F.l1_loss(rf, target)
 
 
 # =========================================================
