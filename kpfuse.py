@@ -185,7 +185,6 @@ class SuperPoint(nn.Module):
         for p in self.sp.parameters():
             p.requires_grad = False
 
-    @torch.no_grad()
     def forward(self, x):
         out = self.sp(x)
         if not isinstance(out, dict) or "scores" not in out or "descriptors" not in out:
@@ -236,8 +235,11 @@ class SPLoss(nn.Module):
         i = i
         f = f.mean(1, True)
 
-        sv, dv = self.sp(v)
-        si, di = self.sp(i)
+        # Keep source branches out of autograd to save memory; keep fused branch
+        # differentiable so SP loss contributes gradients to FusionNet.
+        with torch.no_grad():
+            sv, dv = self.sp(v)
+            si, di = self.sp(i)
         sf, df = self.sp(f)
 
         # Dense-map mode (older Kornia SuperPoint variants).
@@ -299,16 +301,16 @@ class Loss(nn.Module):
         self.sp = SPLoss()
         self.sobel = SobelGrad()
 
-    def forward(self, v, i, f):
+    def forward(self, v, i, gt, f):
         t = torch.max(v, i.repeat(1, 3, 1, 1))
 
-        ssim_term = K.losses.ssim_loss(f, t, window_size=11)
+        ssim_term = K.losses.ssim_loss(f, gt, window_size=11)
         if ssim_term.ndim > 0:
             ssim_term = ssim_term.mean()
 
         grad_term = F.l1_loss(
             self.sobel(f.mean(1, True)),
-            torch.max(self.sobel(v.mean(1, True)), self.sobel(i)),
+            self.sobel(gt.mean(1, True)),
         )
 
         return F.l1_loss(f, t) + 0.5 * ssim_term + grad_term + 2.0 * self.sp(v, i, f)
@@ -379,14 +381,15 @@ def train(args):
         print(f"Epoch {e + 1}/{args.epochs}")
         net.train()
         tl = 0.0
-        for v, i, _ in tqdm(tr_loader):
+        for v, i, gt in tqdm(tr_loader):
             v = v.to(device, non_blocking=True)
             i = i.to(device, non_blocking=True)
+            gt = gt.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 f = net(v, i)
-                loss = loss_fn(v, i, f)
+                loss = loss_fn(v, i, gt, f)
 
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -396,11 +399,12 @@ def train(args):
         net.eval()
         vloss = 0.0
         with torch.no_grad():
-            for v, i, _ in vl_loader:
+            for v, i, gt in vl_loader:
                 v = v.to(device, non_blocking=True)
                 i = i.to(device, non_blocking=True)
+                gt = gt.to(device, non_blocking=True)
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    vloss += loss_fn(v, i, net(v, i)).item()
+                    vloss += loss_fn(v, i, gt, net(v, i)).item()
 
         tl /= max(1, len(tr_loader))
         vloss /= max(1, len(vl_loader))
