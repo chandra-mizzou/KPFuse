@@ -296,13 +296,27 @@ class SobelGrad(nn.Module):
 
 
 class Loss(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        w_gt_l1: float = 1.0,
+        w_ssim: float = 0.9,
+        w_grad: float = 0.7,
+        w_src_l1: float = 0.25,
+        w_sp: float = 0.08,
+    ):
         super().__init__()
         self.sp = SPLoss()
         self.sobel = SobelGrad()
+        self.w_gt_l1 = w_gt_l1
+        self.w_ssim = w_ssim
+        self.w_grad = w_grad
+        self.w_src_l1 = w_src_l1
+        self.w_sp = w_sp
 
     def forward(self, v, i, gt, f):
-        t = torch.max(v, i.repeat(1, 3, 1, 1))
+        src_target = torch.max(v, i.repeat(1, 3, 1, 1))
+        gt_l1 = F.l1_loss(f, gt)
+        src_l1 = F.l1_loss(f, src_target)
 
         ssim_term = K.losses.ssim_loss(f, gt, window_size=11)
         if ssim_term.ndim > 0:
@@ -313,7 +327,14 @@ class Loss(nn.Module):
             self.sobel(gt.mean(1, True)),
         )
 
-        return F.l1_loss(f, t) + 0.5 * ssim_term + grad_term + 2.0 * self.sp(v, i, f)
+        sp_term = self.sp(v, i, f)
+        return (
+            self.w_gt_l1 * gt_l1
+            + self.w_ssim * ssim_term
+            + self.w_grad * grad_term
+            + self.w_src_l1 * src_l1
+            + self.w_sp * sp_term
+        )
 
 
 # =========================================================
@@ -368,7 +389,13 @@ def train(args):
     print(f"Matched samples: {n_samples} | train batches: {len(tr_loader)} | val batches: {len(vl_loader)}")
 
     net = FusionNet().to(device)
-    loss_fn = Loss().to(device)
+    loss_fn = Loss(
+        w_gt_l1=args.w_gt_l1,
+        w_ssim=args.w_ssim,
+        w_grad=args.w_grad,
+        w_src_l1=args.w_src_l1,
+        w_sp=args.w_sp,
+    ).to(device)
     loss_fn.sp.eval()
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -436,6 +463,12 @@ def parse_args():
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--ckpt", type=str, default="best_kpfuse.pth")
+    # Rebalanced defaults after switching SSIM/gradient supervision to GT.
+    p.add_argument("--w-gt-l1", type=float, default=1.0)
+    p.add_argument("--w-ssim", type=float, default=0.9)
+    p.add_argument("--w-grad", type=float, default=0.7)
+    p.add_argument("--w-src-l1", type=float, default=0.25)
+    p.add_argument("--w-sp", type=float, default=0.08)
     return p.parse_args()
 
 
