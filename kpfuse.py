@@ -180,7 +180,9 @@ class FusionTokenBlock(nn.Module):
         )
 
     def forward(self, vf, if_, h, w):
+        # Cross-attention: VIS tokens query IR tokens (vis -> ir).
         attn = torch.sigmoid(self.a) * self.v2i(vf, if_, h, w)
+        # Cross-attention: IR tokens query VIS tokens (ir -> vis).
         attn = attn + torch.sigmoid(self.b) * self.i2v(if_, vf, h, w)
         vf = vf + attn
         vf = vf + self.ffn(self.norm(vf))
@@ -379,6 +381,29 @@ class Loss(nn.Module):
 # =========================================================
 # TRAINING
 # =========================================================
+def _compute_split_counts(n_samples: int, train_ratio: float, val_ratio: float, test_ratio: float):
+    if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-8:
+        raise ValueError("train/val/test ratios must sum to 1.0")
+    if n_samples < 3:
+        raise RuntimeError("Need at least 3 samples to create train/val/test splits.")
+
+    n_train = max(1, int(n_samples * train_ratio))
+    n_val = max(1, int(n_samples * val_ratio))
+    n_test = n_samples - n_train - n_val
+
+    # Keep at least one sample in each split for very small datasets.
+    while n_test < 1:
+        if n_train >= n_val and n_train > 1:
+            n_train -= 1
+        elif n_val > 1:
+            n_val -= 1
+        else:
+            raise RuntimeError("Unable to build non-empty train/val/test splits.")
+        n_test = n_samples - n_train - n_val
+
+    return n_train, n_val, n_test
+
+
 def make_loaders(
     vis_dir,
     ir_dir,
@@ -386,28 +411,28 @@ def make_loaders(
     size,
     batch_size,
     workers,
-    split,
     seed,
+    train_ratio,
+    val_ratio,
+    test_ratio,
     train_aug=True,
 ):
     samples = match_triplets(vis_dir, ir_dir, gt_dir)
-    if len(samples) < 2:
-        raise RuntimeError(
-            "Need at least 2 matched triplets with the same filenames in vis/ir/gt."
-        )
-
-    n_train = max(1, int(split * len(samples)))
-    n_val = len(samples) - n_train
-    if n_val == 0:
-        n_train -= 1
-        n_val = 1
+    n_train, n_val, n_test = _compute_split_counts(
+        len(samples),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+    )
 
     gen = torch.Generator().manual_seed(seed)
     order = torch.randperm(len(samples), generator=gen).tolist()
     tr_ids = order[:n_train]
-    vl_ids = order[n_train:]
+    vl_ids = order[n_train : n_train + n_val]
+    te_ids = order[n_train + n_val :]
     tr_ds = FusionDataset(samples, size=size, augment=train_aug, indices=tr_ids)
     vl_ds = FusionDataset(samples, size=size, augment=False, indices=vl_ids)
+    te_ds = FusionDataset(samples, size=size, augment=False, indices=te_ids)
 
     pin = torch.cuda.is_available()
     tr_loader = DataLoader(
@@ -426,21 +451,15 @@ def make_loaders(
         pin_memory=pin,
         persistent_workers=workers > 0,
     )
-    return tr_loader, vl_loader, len(samples)
-
-
-def make_test_loader(vis_dir, ir_dir, size, batch_size, workers):
-    ds = PairDataset(vis_dir, ir_dir, size=size)
-    pin = torch.cuda.is_available()
-    loader = DataLoader(
-        ds,
+    te_loader = DataLoader(
+        te_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=workers,
         pin_memory=pin,
         persistent_workers=workers > 0,
     )
-    return loader, len(ds)
+    return tr_loader, vl_loader, te_loader, len(samples), n_train, n_val, n_test
 
 
 @torch.no_grad()
@@ -517,33 +536,26 @@ def train(args):
     use_amp = device.type == "cuda"
     autocast_dev = "cuda" if use_amp else "cpu"
 
-    tr_loader, vl_loader, n_samples = make_loaders(
+    tr_loader, vl_loader, te_loader, n_samples, n_train, n_val, n_test = make_loaders(
         args.vis_dir,
         args.ir_dir,
         args.gt_dir,
         args.size,
         args.batch_size,
         args.workers,
-        args.split,
         args.seed,
+        args.train_ratio,
+        args.val_ratio,
+        args.test_ratio,
         args.train_aug,
     )
-    print(f"Matched samples: {n_samples} | train batches: {len(tr_loader)} | val batches: {len(vl_loader)}")
-
-    preview_loader = vl_loader
-    preview_with_gt = True
-    if args.test_vis_dir and args.test_ir_dir:
-        preview_loader, n_test = make_test_loader(
-            args.test_vis_dir,
-            args.test_ir_dir,
-            args.size,
-            args.test_batch_size,
-            args.workers,
-        )
-        preview_with_gt = False
-        print(f"Preview source: test pairs | samples: {n_test}")
-    else:
-        print("Preview source: validation split (set --test-vis-dir/--test-ir-dir to use a separate test folder)")
+    print(
+        f"Matched samples: {n_samples} | "
+        f"train: {n_train} ({len(tr_loader)} batches) | "
+        f"val: {n_val} ({len(vl_loader)} batches) | "
+        f"test: {n_test} ({len(te_loader)} batches)"
+    )
+    print("Preview source: internal 5% test split from the same dataset")
 
     net = FusionNet(
         base_ch=args.base_ch,
@@ -628,13 +640,13 @@ def train(args):
 
         save_epoch_previews(
             net=net,
-            loader=preview_loader,
+            loader=te_loader,
             device=device,
             use_amp=use_amp,
             out_root=args.preview_dir,
             epoch=e + 1,
             max_items=args.preview_count,
-            include_gt=preview_with_gt,
+            include_gt=True,
         )
 
         if cnt >= args.patience:
@@ -650,7 +662,9 @@ def parse_args():
     p.add_argument("--size", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--workers", type=int, default=2)
-    p.add_argument("--split", type=float, default=0.8)
+    p.add_argument("--train-ratio", type=float, default=0.85)
+    p.add_argument("--val-ratio", type=float, default=0.10)
+    p.add_argument("--test-ratio", type=float, default=0.05)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -663,9 +677,6 @@ def parse_args():
     p.add_argument("--ckpt", type=str, default="best_kpfuse.pth")
     p.add_argument("--preview-dir", type=str, default="kpfuse_previews")
     p.add_argument("--preview-count", type=int, default=6)
-    p.add_argument("--test-vis-dir", type=str, default="", help="Optional VIS folder for test-time per-epoch previews")
-    p.add_argument("--test-ir-dir", type=str, default="", help="Optional IR folder for test-time per-epoch previews")
-    p.add_argument("--test-batch-size", type=int, default=4)
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
     p.set_defaults(train_aug=True)
@@ -687,14 +698,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    if bool(args.test_vis_dir) ^ bool(args.test_ir_dir):
-        raise ValueError("Set both --test-vis-dir and --test-ir-dir, or leave both unset.")
+    if abs((args.train_ratio + args.val_ratio + args.test_ratio) - 1.0) > 1e-8:
+        raise ValueError("--train-ratio + --val-ratio + --test-ratio must equal 1.0")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
-    for opt_path in [args.test_vis_dir, args.test_ir_dir]:
-        if opt_path and not os.path.isdir(opt_path):
-            raise FileNotFoundError(f"Missing directory: {opt_path}")
     train(args)
 
 # nohup python3 -u bidirectional_crossattn.py --vis-dir '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/vi' --ir-dir '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/ir' --gt-dir '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/SGT_Direct_Fusion' --epochs 100 --batch-size 12 --size 512 --base-ch 48 --bottleneck-ch 192 --attn-depth 3 --attn-heads 8 --attn-sr 2  --workers 4 --ckpt kpfuse_v1.pth  > train_log_kpfuse.txt 2>&1 &
