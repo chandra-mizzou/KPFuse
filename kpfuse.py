@@ -2,14 +2,17 @@ import argparse
 import os
 import random
 from pathlib import Path
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import torchvision.transforms as T
+import torchvision.utils as vutils
+from torchvision.transforms import functional as TF
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 try:
     import kornia as K
@@ -48,14 +51,24 @@ def match_triplets(vis_dir: str, ir_dir: str, gt_dir: str):
 
 
 class FusionDataset(Dataset):
-    def __init__(self, vis_dir: str, ir_dir: str, gt_dir: str, size: int = 256):
-        self.samples = match_triplets(vis_dir, ir_dir, gt_dir)
-        if len(self.samples) < 2:
-            raise RuntimeError(
-                "Need at least 2 matched triplets with the same filenames in vis/ir/gt."
-            )
+    def __init__(
+        self,
+        samples,
+        size: int = 256,
+        augment: bool = False,
+        indices: Optional[Sequence[int]] = None,
+    ):
+        if indices is None:
+            self.samples = list(samples)
+        else:
+            self.samples = [samples[j] for j in indices]
 
-        self.tf = T.Compose([T.Resize((size, size)), T.ToTensor()])
+        if len(self.samples) < 1:
+            raise RuntimeError("Dataset split has no samples.")
+
+        self.augment = augment
+        self.resize = T.Resize((size, size))
+        self.to_tensor = T.ToTensor()
 
     def __len__(self):
         return len(self.samples)
@@ -63,10 +76,53 @@ class FusionDataset(Dataset):
     def __getitem__(self, i):
         vp, ip, gp = self.samples[i]
         with Image.open(vp) as v_img, Image.open(ip) as i_img, Image.open(gp) as g_img:
-            v = self.tf(v_img.convert("RGB"))
-            ir = self.tf(i_img.convert("L"))
-            gt = self.tf(g_img.convert("RGB"))
+            v_img = self.resize(v_img.convert("RGB"))
+            i_img = self.resize(i_img.convert("L"))
+            g_img = self.resize(g_img.convert("RGB"))
+
+            # Apply the exact same geometric augmentation to all modalities.
+            if self.augment:
+                if random.random() < 0.5:
+                    v_img = TF.hflip(v_img)
+                    i_img = TF.hflip(i_img)
+                    g_img = TF.hflip(g_img)
+                if random.random() < 0.2:
+                    v_img = TF.vflip(v_img)
+                    i_img = TF.vflip(i_img)
+                    g_img = TF.vflip(g_img)
+
+            v = self.to_tensor(v_img)
+            ir = self.to_tensor(i_img)
+            gt = self.to_tensor(g_img)
         return v, ir, gt
+
+
+def match_pairs(vis_dir: str, ir_dir: str):
+    vis = {p.name: p for p in get_all_images(vis_dir)}
+    ir = {p.name: p for p in get_all_images(ir_dir)}
+    names = sorted(set(vis) & set(ir))
+    return [(str(vis[n]), str(ir[n]), n) for n in names]
+
+
+class PairDataset(Dataset):
+    def __init__(self, vis_dir: str, ir_dir: str, size: int = 256):
+        self.samples = match_pairs(vis_dir, ir_dir)
+        if len(self.samples) < 1:
+            raise RuntimeError(
+                "Need at least 1 matched VIS/IR pair with the same filename in test folders."
+            )
+        self.resize = T.Resize((size, size))
+        self.to_tensor = T.ToTensor()
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        vp, ip, name = self.samples[i]
+        with Image.open(vp) as v_img, Image.open(ip) as i_img:
+            v = self.to_tensor(self.resize(v_img.convert("RGB")))
+            ir = self.to_tensor(self.resize(i_img.convert("L")))
+        return v, ir, name
 
 
 # =========================================================
@@ -323,16 +379,35 @@ class Loss(nn.Module):
 # =========================================================
 # TRAINING
 # =========================================================
-def make_loaders(vis_dir, ir_dir, gt_dir, size, batch_size, workers, split, seed):
-    ds = FusionDataset(vis_dir, ir_dir, gt_dir, size=size)
-    n_train = max(1, int(split * len(ds)))
-    n_val = len(ds) - n_train
+def make_loaders(
+    vis_dir,
+    ir_dir,
+    gt_dir,
+    size,
+    batch_size,
+    workers,
+    split,
+    seed,
+    train_aug=True,
+):
+    samples = match_triplets(vis_dir, ir_dir, gt_dir)
+    if len(samples) < 2:
+        raise RuntimeError(
+            "Need at least 2 matched triplets with the same filenames in vis/ir/gt."
+        )
+
+    n_train = max(1, int(split * len(samples)))
+    n_val = len(samples) - n_train
     if n_val == 0:
         n_train -= 1
         n_val = 1
 
     gen = torch.Generator().manual_seed(seed)
-    tr_ds, vl_ds = random_split(ds, [n_train, n_val], generator=gen)
+    order = torch.randperm(len(samples), generator=gen).tolist()
+    tr_ids = order[:n_train]
+    vl_ids = order[n_train:]
+    tr_ds = FusionDataset(samples, size=size, augment=train_aug, indices=tr_ids)
+    vl_ds = FusionDataset(samples, size=size, augment=False, indices=vl_ids)
 
     pin = torch.cuda.is_available()
     tr_loader = DataLoader(
@@ -351,13 +426,96 @@ def make_loaders(vis_dir, ir_dir, gt_dir, size, batch_size, workers, split, seed
         pin_memory=pin,
         persistent_workers=workers > 0,
     )
-    return tr_loader, vl_loader, len(ds)
+    return tr_loader, vl_loader, len(samples)
+
+
+def make_test_loader(vis_dir, ir_dir, size, batch_size, workers):
+    ds = PairDataset(vis_dir, ir_dir, size=size)
+    pin = torch.cuda.is_available()
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=pin,
+        persistent_workers=workers > 0,
+    )
+    return loader, len(ds)
+
+
+@torch.no_grad()
+def save_epoch_previews(
+    net,
+    loader,
+    device,
+    use_amp,
+    out_root,
+    epoch,
+    max_items,
+    include_gt=True,
+):
+    if max_items <= 0:
+        return
+
+    epoch_dir = Path(out_root) / f"epoch_{epoch:03d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    autocast_dev = "cuda" if device.type == "cuda" else "cpu"
+
+    net.eval()
+    saved = 0
+    for batch in loader:
+        if include_gt:
+            v, i, gt = batch
+            names = None
+        else:
+            v, i, names = batch
+            gt = None
+
+        v = v.to(device, non_blocking=True)
+        i = i.to(device, non_blocking=True)
+        with torch.amp.autocast(autocast_dev, enabled=use_amp):
+            f = net(v, i)
+
+        v = v.detach().cpu()
+        i = i.detach().cpu()
+        f = f.detach().cpu().clamp_(0.0, 1.0)
+        if gt is not None:
+            gt = gt.detach().cpu()
+
+        bsz = f.shape[0]
+        for bi in range(bsz):
+            if saved >= max_items:
+                break
+
+            if names is None:
+                stem = f"sample_{saved + 1:04d}"
+            else:
+                stem = Path(str(names[bi])).stem or f"sample_{saved + 1:04d}"
+
+            fused_path = epoch_dir / f"{stem}_fused.png"
+            panel_path = epoch_dir / f"{stem}_panel.png"
+
+            ir_rgb = i[bi].repeat(3, 1, 1)
+            panes = [v[bi], ir_rgb, f[bi]]
+            if gt is not None:
+                panes.append(gt[bi])
+            panel = torch.cat(panes, dim=2)
+
+            vutils.save_image(f[bi], str(fused_path))
+            vutils.save_image(panel, str(panel_path))
+            saved += 1
+
+        if saved >= max_items:
+            break
+
+    print(f"Saved {saved} preview sample(s) to: {epoch_dir}")
 
 
 def train(args):
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
+    autocast_dev = "cuda" if use_amp else "cpu"
 
     tr_loader, vl_loader, n_samples = make_loaders(
         args.vis_dir,
@@ -368,8 +526,24 @@ def train(args):
         args.workers,
         args.split,
         args.seed,
+        args.train_aug,
     )
     print(f"Matched samples: {n_samples} | train batches: {len(tr_loader)} | val batches: {len(vl_loader)}")
+
+    preview_loader = vl_loader
+    preview_with_gt = True
+    if args.test_vis_dir and args.test_ir_dir:
+        preview_loader, n_test = make_test_loader(
+            args.test_vis_dir,
+            args.test_ir_dir,
+            args.size,
+            args.test_batch_size,
+            args.workers,
+        )
+        preview_with_gt = False
+        print(f"Preview source: test pairs | samples: {n_test}")
+    else:
+        print("Preview source: validation split (set --test-vis-dir/--test-ir-dir to use a separate test folder)")
 
     net = FusionNet(
         base_ch=args.base_ch,
@@ -387,12 +561,24 @@ def train(args):
         w_sp=args.w_sp,
     ).to(device)
     loss_fn.sp.eval()
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    opt = torch.optim.AdamW(
+        net.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode="min",
+        factor=args.lr_decay,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best = float("inf")
     cnt = 0
     os.makedirs(os.path.dirname(args.ckpt) or ".", exist_ok=True)
+    os.makedirs(args.preview_dir, exist_ok=True)
 
 
     for e in range(args.epochs):
@@ -405,11 +591,14 @@ def train(args):
             gt = gt.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(autocast_dev, enabled=use_amp):
                 f = net(v, i)
                 loss = loss_fn(v, i, gt, f)
 
             scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
             tl += loss.item()
@@ -421,12 +610,13 @@ def train(args):
                 v = v.to(device, non_blocking=True)
                 i = i.to(device, non_blocking=True)
                 gt = gt.to(device, non_blocking=True)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast(autocast_dev, enabled=use_amp):
                     vloss += loss_fn(v, i, gt, net(v, i)).item()
 
         tl /= max(1, len(tr_loader))
         vloss /= max(1, len(vl_loader))
-        print(f"TL={tl:.4f} VL={vloss:.4f}")
+        scheduler.step(vloss)
+        print(f"TL={tl:.4f} VL={vloss:.4f} LR={opt.param_groups[0]['lr']:.2e}")
 
         if vloss < best:
             best = vloss
@@ -435,9 +625,21 @@ def train(args):
             print(f"Saved best model to: {args.ckpt}")
         else:
             cnt += 1
-            if cnt >= args.patience:
-                print("Early stopping")
-                break
+
+        save_epoch_previews(
+            net=net,
+            loader=preview_loader,
+            device=device,
+            use_amp=use_amp,
+            out_root=args.preview_dir,
+            epoch=e + 1,
+            max_items=args.preview_count,
+            include_gt=preview_with_gt,
+        )
+
+        if cnt >= args.patience:
+            print("Early stopping")
+            break
 
 
 def parse_args():
@@ -451,9 +653,20 @@ def parse_args():
     p.add_argument("--split", type=float, default=0.8)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--lr-decay", type=float, default=0.5)
+    p.add_argument("--lr-patience", type=int, default=3)
+    p.add_argument("--min-lr", type=float, default=1e-6)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--ckpt", type=str, default="best_kpfuse.pth")
+    p.add_argument("--preview-dir", type=str, default="kpfuse_previews")
+    p.add_argument("--preview-count", type=int, default=6)
+    p.add_argument("--test-vis-dir", type=str, default="", help="Optional VIS folder for test-time per-epoch previews")
+    p.add_argument("--test-ir-dir", type=str, default="", help="Optional IR folder for test-time per-epoch previews")
+    p.add_argument("--test-batch-size", type=int, default=4)
+    p.add_argument("--train-aug", action=argparse.BooleanOptionalAction, default=True)
     # Rebalanced defaults after switching SSIM/gradient supervision to GT.
     p.add_argument("--w-gt-l1", type=float, default=1.0)
     p.add_argument("--w-ssim", type=float, default=0.9)
@@ -472,9 +685,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    if bool(args.test_vis_dir) ^ bool(args.test_ir_dir):
+        raise ValueError("Set both --test-vis-dir and --test-ir-dir, or leave both unset.")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
+    for opt_path in [args.test_vis_dir, args.test_ir_dir]:
+        if opt_path and not os.path.isdir(opt_path):
+            raise FileNotFoundError(f"Missing directory: {opt_path}")
     train(args)
 
 # nohup python3 -u bidirectional_crossattn.py --vis-dir '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/vi' --ir-dir '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/ir' --gt-dir '/home/chandra/Documents/Mizzou/VIS_IR_Fusion/training_data/SGT_Direct_Fusion' --epochs 100 --batch-size 12 --size 512 --base-ch 48 --bottleneck-ch 192 --attn-depth 3 --attn-heads 8 --attn-sr 2  --workers 4 --ckpt kpfuse_v1.pth  > train_log_kpfuse.txt 2>&1 &
