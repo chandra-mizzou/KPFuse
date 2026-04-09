@@ -666,7 +666,9 @@ def parse_args():
     p.add_argument("--test-vis-dir", type=str, default="", help="Optional VIS folder for test-time per-epoch previews")
     p.add_argument("--test-ir-dir", type=str, default="", help="Optional IR folder for test-time per-epoch previews")
     p.add_argument("--test-batch-size", type=int, default=4)
-    p.add_argument("--train-aug", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--train-aug", dest="train_aug", action="store_true")
+    p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
+    p.set_defaults(train_aug=True)
     # Rebalanced defaults after switching SSIM/gradient supervision to GT.
     p.add_argument("--w-gt-l1", type=float, default=1.0)
     p.add_argument("--w-ssim", type=float, default=0.9)
