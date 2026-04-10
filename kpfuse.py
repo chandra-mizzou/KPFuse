@@ -302,13 +302,23 @@ class KeyNetResponse(nn.Module):
 
 
 class KeyNetLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, vis_weight: float = 1.0, ir_weight: float = 2.0):
         super().__init__()
         self.detector = KeyNetResponse()
+        self.w_vis = vis_weight
+        self.w_ir = ir_weight
+
+    @staticmethod
+    def _normalize_map(x: torch.Tensor) -> torch.Tensor:
+        x_min = x.amin(dim=(-2, -1), keepdim=True)
+        x_max = x.amax(dim=(-2, -1), keepdim=True)
+        return (x - x_min) / (x_max - x_min + 1e-6)
 
     def forward(self, v, i, f):
-        v = v.mean(1, True)
-        f = f.mean(1, True)
+        detector_dtype = next(self.detector.parameters()).dtype
+        v = v.mean(1, True).to(dtype=detector_dtype)
+        i = i.to(dtype=detector_dtype)
+        f = f.mean(1, True).to(dtype=detector_dtype)
 
         with torch.no_grad():
             rv = self.detector(v)
@@ -317,8 +327,15 @@ class KeyNetLoss(nn.Module):
 
         if rf.shape[-2:] != rv.shape[-2:]:
             rf = F.interpolate(rf, size=rv.shape[-2:], mode="bilinear", align_corners=False)
-        target = torch.max(rv, ri)
-        return F.l1_loss(rf, target)
+
+        # Normalize each response map to reduce VIS amplitude dominance.
+        rv = self._normalize_map(rv)
+        ri = self._normalize_map(ri)
+        rf = self._normalize_map(rf)
+
+        vis_term = F.l1_loss(rf, rv)
+        ir_term = F.l1_loss(rf, ri)
+        return (self.w_vis * vis_term) + (self.w_ir * ir_term)
 
 
 # =========================================================
@@ -346,9 +363,11 @@ class Loss(nn.Module):
         w_grad: float = 0.7,
         w_src_l1: float = 0.25,
         w_sp: float = 0.08,
+        sp_vis_weight: float = 1.0,
+        sp_ir_weight: float = 2.0,
     ):
         super().__init__()
-        self.sp = KeyNetLoss()
+        self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
         self.sobel = SobelGrad()
         self.w_gt_l1 = w_gt_l1
         self.w_ssim = w_ssim
@@ -383,6 +402,12 @@ class Loss(nn.Module):
 # =========================================================
 # TRAINING
 # =========================================================
+def _normalize_response_map(x: torch.Tensor) -> torch.Tensor:
+    x_min = x.amin(dim=(-2, -1), keepdim=True)
+    x_max = x.amax(dim=(-2, -1), keepdim=True)
+    return (x - x_min) / (x_max - x_min + 1e-6)
+
+
 def _retention_from_responses(src_resp: torch.Tensor, fused_resp: torch.Tensor, topk: int) -> torch.Tensor:
     if fused_resp.shape[-2:] != src_resp.shape[-2:]:
         fused_resp = F.interpolate(
@@ -443,6 +468,11 @@ def evaluate_keypoint_retention(
         rv = detector(vg)
         ri = detector(ig)
         rf = detector(fg)
+
+        # Response normalization reduces VIS intensity dominance.
+        rv = _normalize_response_map(rv)
+        ri = _normalize_response_map(ri)
+        rf = _normalize_response_map(rf)
 
         vis_ret = _retention_from_responses(rv, rf, topk=topk)
         ir_ret = _retention_from_responses(ri, rf, topk=topk)
@@ -653,6 +683,8 @@ def train(args):
         w_grad=args.w_grad,
         w_src_l1=args.w_src_l1,
         w_sp=args.w_sp,
+        sp_vis_weight=args.sp_vis_weight,
+        sp_ir_weight=args.sp_ir_weight,
     ).to(device)
     loss_fn.sp.eval()
     opt = torch.optim.AdamW(
@@ -748,20 +780,43 @@ def train(args):
         )
 
         # Adaptive weighting for next epoch:
-        # if retention is below target, increase keypoint-focused losses.
-        err = args.retention_target - mean_ret
-        sp_scale = max(0.5, 1.0 + (args.retention_weight_lr * err))
-        src_scale = max(0.7, 1.0 + (0.5 * args.retention_weight_lr * err))
+        # - improve IR retention toward target
+        # - preserve VIS retention above a floor
+        err_ir = args.retention_target_ir - ir_ret
+        err_vis = args.retention_target_vis - vis_ret
 
-        loss_fn.w_sp = float(
-            min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp * sp_scale))
+        sp_scale = 1.0 + (args.retention_weight_lr_ir * err_ir)
+        src_scale = 1.0 + (0.5 * args.retention_weight_lr_ir * err_ir)
+
+        # Protect strong VIS retention from dropping.
+        if vis_ret < args.retention_vis_floor:
+            vis_gap = args.retention_vis_floor - vis_ret
+            damp = max(0.55, 1.0 - (args.retention_weight_lr_vis * vis_gap))
+            sp_scale *= damp
+            src_scale *= max(0.75, damp)
+            # Also ease IR-overweight growth when VIS dips.
+            loss_fn.sp.w_ir = max(loss_fn.sp.w_vis, loss_fn.sp.w_ir * damp)
+
+        # Slow VIS-weight adjustment to keep both modalities represented.
+        vis_scale = 1.0 + (0.25 * args.retention_weight_lr_vis * err_vis)
+        loss_fn.sp.w_vis = float(min(2.0, max(0.5, loss_fn.sp.w_vis * vis_scale)))
+        # Keep IR branch emphasized but bounded.
+        ir_scale = 1.0 + (0.35 * args.retention_weight_lr_ir * err_ir)
+        loss_fn.sp.w_ir = float(
+            min(
+                args.sp_ir_weight_max,
+                max(loss_fn.sp.w_vis, loss_fn.sp.w_ir * ir_scale),
+            )
         )
+
+        loss_fn.w_sp = float(min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp * sp_scale)))
         loss_fn.w_src_l1 = float(
             min(args.w_src_l1_max, max(args.w_src_l1_min, loss_fn.w_src_l1 * src_scale))
         )
         print(
             f"Updated next-epoch weights: w_sp={loss_fn.w_sp:.4f}, "
-            f"w_src_l1={loss_fn.w_src_l1:.4f}"
+            f"w_src_l1={loss_fn.w_src_l1:.4f}, "
+            f"sp_vis_w={loss_fn.sp.w_vis:.3f}, sp_ir_w={loss_fn.sp.w_ir:.3f}"
         )
         epoch_secs = time.perf_counter() - epoch_start
         total_secs = time.perf_counter() - run_start
@@ -806,17 +861,25 @@ def parse_args():
         default=16,
         help="Max batches for per-epoch retention eval (-1 for full split).",
     )
+    p.add_argument("--retention-target-vis", type=float, default=0.88)
+    p.add_argument("--retention-target-ir", type=float, default=0.35)
     p.add_argument(
-        "--retention-target",
+        "--retention-vis-floor",
         type=float,
-        default=0.60,
-        help="Target mean retention to drive dynamic loss re-weighting.",
+        default=0.85,
+        help="Protect VIS retention by damping IR-push updates below this floor.",
     )
     p.add_argument(
-        "--retention-weight-lr",
+        "--retention-weight-lr-ir",
         type=float,
-        default=0.4,
-        help="Aggressiveness for dynamic loss-weight updates from retention error.",
+        default=0.9,
+        help="Aggressiveness for IR-retention driven adaptation.",
+    )
+    p.add_argument(
+        "--retention-weight-lr-vis",
+        type=float,
+        default=0.35,
+        help="Aggressiveness for VIS-retention balancing/protection.",
     )
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
@@ -831,6 +894,9 @@ def parse_args():
     p.add_argument("--w-sp", type=float, default=0.08)
     p.add_argument("--w-sp-min", type=float, default=0.02)
     p.add_argument("--w-sp-max", type=float, default=0.8)
+    p.add_argument("--sp-vis-weight", type=float, default=1.0)
+    p.add_argument("--sp-ir-weight", type=float, default=2.0)
+    p.add_argument("--sp-ir-weight-max", type=float, default=4.0)
     # Capacity scaling knobs for higher GPU utilization.
     p.add_argument("--base-ch", type=int, default=32)
     p.add_argument("--bottleneck-ch", type=int, default=256)
