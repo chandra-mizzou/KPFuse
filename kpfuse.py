@@ -1,8 +1,10 @@
 import argparse
 import os
 import random
+import time
 from pathlib import Path
 from typing import Optional, Sequence
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -612,6 +614,7 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
     autocast_dev = "cuda" if use_amp else "cpu"
+    run_start = time.perf_counter()
 
     tr_loader, vl_loader, te_loader, n_samples, n_train, n_val, n_test = make_loaders(
         args.vis_dir,
@@ -673,7 +676,9 @@ def train(args):
 
 
     for e in range(args.epochs):
-        print(f"Epoch {e + 1}/{args.epochs}")
+        epoch_start_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        epoch_start = time.perf_counter()
+        print(f"Epoch {e + 1}/{args.epochs} | start: {epoch_start_ts}")
         net.train()
         tl = 0.0
         for v, i, gt in tr_loader:
@@ -757,6 +762,12 @@ def train(args):
         print(
             f"Updated next-epoch weights: w_sp={loss_fn.w_sp:.4f}, "
             f"w_src_l1={loss_fn.w_src_l1:.4f}"
+        )
+        epoch_secs = time.perf_counter() - epoch_start
+        total_secs = time.perf_counter() - run_start
+        print(
+            f"Epoch {e + 1} time: {epoch_secs:.1f}s ({epoch_secs / 60.0:.2f} min) | "
+            f"total elapsed: {total_secs / 60.0:.2f} min"
         )
 
         if cnt >= args.patience:
