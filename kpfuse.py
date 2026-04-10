@@ -419,6 +419,7 @@ def evaluate_keypoint_retention(
     autocast_dev = "cuda" if device.type == "cuda" else "cpu"
     net.eval()
     detector.eval()
+    detector_dtype = next(detector.parameters()).dtype
 
     sum_vis = 0.0
     sum_ir = 0.0
@@ -433,10 +434,12 @@ def evaluate_keypoint_retention(
         with torch.amp.autocast(autocast_dev, enabled=use_amp):
             f = net(v, i)
 
-        vg = v.mean(1, True)
-        fg = f.mean(1, True)
+        # KeyNet expects fp32-style inputs; fused output may be fp16 from autocast.
+        vg = v.mean(1, True).to(dtype=detector_dtype)
+        ig = i.to(dtype=detector_dtype)
+        fg = f.mean(1, True).to(dtype=detector_dtype)
         rv = detector(vg)
-        ri = detector(i)
+        ri = detector(ig)
         rf = detector(fg)
 
         vis_ret = _retention_from_responses(rv, rf, topk=topk)
