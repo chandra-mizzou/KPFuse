@@ -381,6 +381,80 @@ class Loss(nn.Module):
 # =========================================================
 # TRAINING
 # =========================================================
+def _retention_from_responses(src_resp: torch.Tensor, fused_resp: torch.Tensor, topk: int) -> torch.Tensor:
+    if fused_resp.shape[-2:] != src_resp.shape[-2:]:
+        fused_resp = F.interpolate(
+            fused_resp, size=src_resp.shape[-2:], mode="bilinear", align_corners=False
+        )
+
+    src_flat = src_resp.flatten(1)
+    fused_flat = fused_resp.flatten(1)
+    k = min(topk, src_flat.shape[1], fused_flat.shape[1])
+    if k < 1:
+        raise ValueError("topk must be >= 1 for keypoint retention.")
+
+    src_idx = src_flat.topk(k=k, dim=1).indices
+    fused_idx = fused_flat.topk(k=k, dim=1).indices
+
+    src_mask = torch.zeros_like(src_flat, dtype=torch.bool)
+    fused_mask = torch.zeros_like(fused_flat, dtype=torch.bool)
+    src_mask.scatter_(1, src_idx, True)
+    fused_mask.scatter_(1, fused_idx, True)
+
+    inter = (src_mask & fused_mask).sum(dim=1).float()
+    denom = src_mask.sum(dim=1).clamp_min(1).float()
+    return inter / denom
+
+
+@torch.no_grad()
+def evaluate_keypoint_retention(
+    net,
+    detector,
+    loader,
+    device,
+    use_amp,
+    topk: int,
+    max_batches: int,
+):
+    autocast_dev = "cuda" if device.type == "cuda" else "cpu"
+    net.eval()
+    detector.eval()
+
+    sum_vis = 0.0
+    sum_ir = 0.0
+    n = 0
+
+    for bi, (v, i, _gt) in enumerate(loader):
+        if max_batches > 0 and bi >= max_batches:
+            break
+
+        v = v.to(device, non_blocking=True)
+        i = i.to(device, non_blocking=True)
+        with torch.amp.autocast(autocast_dev, enabled=use_amp):
+            f = net(v, i)
+
+        vg = v.mean(1, True)
+        fg = f.mean(1, True)
+        rv = detector(vg)
+        ri = detector(i)
+        rf = detector(fg)
+
+        vis_ret = _retention_from_responses(rv, rf, topk=topk)
+        ir_ret = _retention_from_responses(ri, rf, topk=topk)
+
+        sum_vis += vis_ret.sum().item()
+        sum_ir += ir_ret.sum().item()
+        n += v.shape[0]
+
+    if n == 0:
+        return 0.0, 0.0, 0.0
+
+    vis_score = sum_vis / n
+    ir_score = sum_ir / n
+    mean_score = 0.5 * (vis_score + ir_score)
+    return vis_score, ir_score, mean_score
+
+
 def _compute_split_counts(n_samples: int, train_ratio: float, val_ratio: float, test_ratio: float):
     if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-8:
         raise ValueError("train/val/test ratios must sum to 1.0")
@@ -556,6 +630,8 @@ def train(args):
         f"test: {n_test} ({len(te_loader)} batches)"
     )
     print("Preview source: internal 5% test split from the same dataset")
+    retention_loader = vl_loader if args.retention_split == "val" else te_loader
+    print(f"Retention source: internal {args.retention_split} split")
 
     net = FusionNet(
         base_ch=args.base_ch,
@@ -630,6 +706,20 @@ def train(args):
         scheduler.step(vloss)
         print(f"TL={tl:.4f} VL={vloss:.4f} LR={opt.param_groups[0]['lr']:.2e}")
 
+        vis_ret, ir_ret, mean_ret = evaluate_keypoint_retention(
+            net=net,
+            detector=loss_fn.sp.detector,
+            loader=retention_loader,
+            device=device,
+            use_amp=use_amp,
+            topk=args.retention_topk,
+            max_batches=args.retention_eval_batches,
+        )
+        print(
+            "Keypoint retention "
+            f"(vis->fused={vis_ret:.4f}, ir->fused={ir_ret:.4f}, mean={mean_ret:.4f})"
+        )
+
         if vloss < best:
             best = vloss
             cnt = 0
@@ -647,6 +737,23 @@ def train(args):
             epoch=e + 1,
             max_items=args.preview_count,
             include_gt=True,
+        )
+
+        # Adaptive weighting for next epoch:
+        # if retention is below target, increase keypoint-focused losses.
+        err = args.retention_target - mean_ret
+        sp_scale = max(0.5, 1.0 + (args.retention_weight_lr * err))
+        src_scale = max(0.7, 1.0 + (0.5 * args.retention_weight_lr * err))
+
+        loss_fn.w_sp = float(
+            min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp * sp_scale))
+        )
+        loss_fn.w_src_l1 = float(
+            min(args.w_src_l1_max, max(args.w_src_l1_min, loss_fn.w_src_l1 * src_scale))
+        )
+        print(
+            f"Updated next-epoch weights: w_sp={loss_fn.w_sp:.4f}, "
+            f"w_src_l1={loss_fn.w_src_l1:.4f}"
         )
 
         if cnt >= args.patience:
@@ -677,6 +784,26 @@ def parse_args():
     p.add_argument("--ckpt", type=str, default="best_kpfuse.pth")
     p.add_argument("--preview-dir", type=str, default="kpfuse_previews")
     p.add_argument("--preview-count", type=int, default=6)
+    p.add_argument("--retention-split", type=str, choices=["val", "test"], default="test")
+    p.add_argument("--retention-topk", type=int, default=300)
+    p.add_argument(
+        "--retention-eval-batches",
+        type=int,
+        default=16,
+        help="Max batches for per-epoch retention eval (-1 for full split).",
+    )
+    p.add_argument(
+        "--retention-target",
+        type=float,
+        default=0.60,
+        help="Target mean retention to drive dynamic loss re-weighting.",
+    )
+    p.add_argument(
+        "--retention-weight-lr",
+        type=float,
+        default=0.4,
+        help="Aggressiveness for dynamic loss-weight updates from retention error.",
+    )
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
     p.set_defaults(train_aug=True)
@@ -685,7 +812,11 @@ def parse_args():
     p.add_argument("--w-ssim", type=float, default=0.9)
     p.add_argument("--w-grad", type=float, default=0.7)
     p.add_argument("--w-src-l1", type=float, default=0.25)
+    p.add_argument("--w-src-l1-min", type=float, default=0.05)
+    p.add_argument("--w-src-l1-max", type=float, default=1.25)
     p.add_argument("--w-sp", type=float, default=0.08)
+    p.add_argument("--w-sp-min", type=float, default=0.02)
+    p.add_argument("--w-sp-max", type=float, default=0.8)
     # Capacity scaling knobs for higher GPU utilization.
     p.add_argument("--base-ch", type=int, default=32)
     p.add_argument("--bottleneck-ch", type=int, default=256)
@@ -700,6 +831,10 @@ if __name__ == "__main__":
     args = parse_args()
     if abs((args.train_ratio + args.val_ratio + args.test_ratio) - 1.0) > 1e-8:
         raise ValueError("--train-ratio + --val-ratio + --test-ratio must equal 1.0")
+    if args.retention_topk < 1:
+        raise ValueError("--retention-topk must be >= 1")
+    if args.retention_eval_batches == 0 or args.retention_eval_batches < -1:
+        raise ValueError("--retention-eval-batches must be -1 or a positive integer")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
