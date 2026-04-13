@@ -408,12 +408,18 @@ def _normalize_response_map(x: torch.Tensor) -> torch.Tensor:
     return (x - x_min) / (x_max - x_min + 1e-6)
 
 
-def _retention_from_responses(src_resp: torch.Tensor, fused_resp: torch.Tensor, topk: int) -> torch.Tensor:
+def _retention_from_responses(
+    src_resp: torch.Tensor,
+    fused_resp: torch.Tensor,
+    topk: int,
+    tolerance_px: int = 0,
+) -> torch.Tensor:
     if fused_resp.shape[-2:] != src_resp.shape[-2:]:
         fused_resp = F.interpolate(
             fused_resp, size=src_resp.shape[-2:], mode="bilinear", align_corners=False
         )
 
+    bsz, ch, h, w = src_resp.shape
     src_flat = src_resp.flatten(1)
     fused_flat = fused_resp.flatten(1)
     k = min(topk, src_flat.shape[1], fused_flat.shape[1])
@@ -423,13 +429,27 @@ def _retention_from_responses(src_resp: torch.Tensor, fused_resp: torch.Tensor, 
     src_idx = src_flat.topk(k=k, dim=1).indices
     fused_idx = fused_flat.topk(k=k, dim=1).indices
 
-    src_mask = torch.zeros_like(src_flat, dtype=torch.bool)
-    fused_mask = torch.zeros_like(fused_flat, dtype=torch.bool)
-    src_mask.scatter_(1, src_idx, True)
-    fused_mask.scatter_(1, fused_idx, True)
+    src_mask = torch.zeros_like(src_flat, dtype=torch.float32)
+    fused_mask = torch.zeros_like(fused_flat, dtype=torch.float32)
+    src_mask.scatter_(1, src_idx, 1.0)
+    fused_mask.scatter_(1, fused_idx, 1.0)
 
-    inter = (src_mask & fused_mask).sum(dim=1).float()
-    denom = src_mask.sum(dim=1).clamp_min(1).float()
+    src_mask = src_mask.view(bsz, ch, h, w)
+    fused_mask = fused_mask.view(bsz, ch, h, w)
+
+    # Neighborhood-tolerant overlap: accept fused keypoints within a
+    # (2 * tolerance_px + 1) window around each source keypoint.
+    if tolerance_px > 0:
+        kernel = (2 * tolerance_px) + 1
+        fused_mask = F.max_pool2d(
+            fused_mask,
+            kernel_size=kernel,
+            stride=1,
+            padding=tolerance_px,
+        )
+
+    inter = (src_mask * (fused_mask > 0).float()).flatten(1).sum(dim=1)
+    denom = src_mask.flatten(1).sum(dim=1).clamp_min(1.0)
     return inter / denom
 
 
@@ -442,6 +462,7 @@ def evaluate_keypoint_retention(
     use_amp,
     topk: int,
     max_batches: int,
+    tolerance_px: int,
 ):
     autocast_dev = "cuda" if device.type == "cuda" else "cpu"
     net.eval()
@@ -474,8 +495,8 @@ def evaluate_keypoint_retention(
         ri = _normalize_response_map(ri)
         rf = _normalize_response_map(rf)
 
-        vis_ret = _retention_from_responses(rv, rf, topk=topk)
-        ir_ret = _retention_from_responses(ri, rf, topk=topk)
+        vis_ret = _retention_from_responses(rv, rf, topk=topk, tolerance_px=tolerance_px)
+        ir_ret = _retention_from_responses(ri, rf, topk=topk, tolerance_px=tolerance_px)
 
         sum_vis += vis_ret.sum().item()
         sum_ir += ir_ret.sum().item()
@@ -705,6 +726,9 @@ def train(args):
     cnt = 0
     os.makedirs(os.path.dirname(args.ckpt) or ".", exist_ok=True)
     os.makedirs(args.preview_dir, exist_ok=True)
+    base_w_sp = args.w_sp
+    base_sp_ir_weight = args.sp_ir_weight
+    prev_ir_ret = None
 
 
     for e in range(args.epochs):
@@ -754,6 +778,7 @@ def train(args):
             use_amp=use_amp,
             topk=args.retention_topk,
             max_batches=args.retention_eval_batches,
+            tolerance_px=args.retention_tolerance_px,
         )
         print(
             "Keypoint retention "
@@ -784,6 +809,15 @@ def train(args):
         # - preserve VIS retention above a floor
         err_ir = args.retention_target_ir - ir_ret
         err_vis = args.retention_target_vis - vis_ret
+        prev_ir_ret_old = prev_ir_ret
+        ir_gain = 0.0 if prev_ir_ret_old is None else (ir_ret - prev_ir_ret_old)
+        prev_ir_ret = ir_ret
+
+        allow_ir_push = (
+            err_ir > 0
+            and vis_ret >= args.retention_vis_floor
+            and (prev_ir_ret_old is None or ir_gain >= args.retention_ir_min_gain)
+        )
 
         sp_scale = 1.0 + (args.retention_weight_lr_ir * err_ir)
         src_scale = 1.0 + (0.5 * args.retention_weight_lr_ir * err_ir)
@@ -809,14 +843,34 @@ def train(args):
             )
         )
 
-        loss_fn.w_sp = float(min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp * sp_scale)))
+        # Prevent runaway escalation of w_sp:
+        # - increase only when IR retention meaningfully improves
+        # - otherwise decay toward baseline.
+        if allow_ir_push:
+            sp_delta = args.w_sp_step * min(1.0, max(0.0, err_ir))
+        else:
+            over_base = max(0.0, loss_fn.w_sp - base_w_sp)
+            sp_delta = -args.w_sp_decay * over_base
+        loss_fn.w_sp = float(
+            min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp + sp_delta))
+        )
         loss_fn.w_src_l1 = float(
             min(args.w_src_l1_max, max(args.w_src_l1_min, loss_fn.w_src_l1 * src_scale))
         )
+
+        # Also keep IR branch weight from drifting too high without gains.
+        if not allow_ir_push:
+            loss_fn.sp.w_ir = float(
+                max(
+                    loss_fn.sp.w_vis,
+                    loss_fn.sp.w_ir - (args.sp_ir_decay * max(0.0, loss_fn.sp.w_ir - base_sp_ir_weight)),
+                )
+            )
         print(
             f"Updated next-epoch weights: w_sp={loss_fn.w_sp:.4f}, "
             f"w_src_l1={loss_fn.w_src_l1:.4f}, "
-            f"sp_vis_w={loss_fn.sp.w_vis:.3f}, sp_ir_w={loss_fn.sp.w_ir:.3f}"
+            f"sp_vis_w={loss_fn.sp.w_vis:.3f}, sp_ir_w={loss_fn.sp.w_ir:.3f}, "
+            f"ir_gain={ir_gain:.4f}, allow_ir_push={allow_ir_push}"
         )
         epoch_secs = time.perf_counter() - epoch_start
         total_secs = time.perf_counter() - run_start
@@ -854,32 +908,44 @@ def parse_args():
     p.add_argument("--preview-dir", type=str, default="kpfuse_previews")
     p.add_argument("--preview-count", type=int, default=6)
     p.add_argument("--retention-split", type=str, choices=["val", "test"], default="test")
-    p.add_argument("--retention-topk", type=int, default=300)
+    p.add_argument("--retention-topk", type=int, default=180)
+    p.add_argument(
+        "--retention-tolerance-px",
+        type=int,
+        default=3,
+        help="Neighborhood tolerance (pixels) for retention overlap via dilation.",
+    )
     p.add_argument(
         "--retention-eval-batches",
         type=int,
         default=16,
         help="Max batches for per-epoch retention eval (-1 for full split).",
     )
-    p.add_argument("--retention-target-vis", type=float, default=0.88)
-    p.add_argument("--retention-target-ir", type=float, default=0.35)
+    p.add_argument("--retention-target-vis", type=float, default=0.62)
+    p.add_argument("--retention-target-ir", type=float, default=0.20)
     p.add_argument(
         "--retention-vis-floor",
         type=float,
-        default=0.85,
+        default=0.58,
         help="Protect VIS retention by damping IR-push updates below this floor.",
     )
     p.add_argument(
         "--retention-weight-lr-ir",
         type=float,
-        default=0.9,
+        default=0.65,
         help="Aggressiveness for IR-retention driven adaptation.",
     )
     p.add_argument(
         "--retention-weight-lr-vis",
         type=float,
-        default=0.35,
+        default=0.25,
         help="Aggressiveness for VIS-retention balancing/protection.",
+    )
+    p.add_argument(
+        "--retention-ir-min-gain",
+        type=float,
+        default=0.001,
+        help="Minimum IR-retention gain required to keep increasing w_sp.",
     )
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
@@ -893,10 +959,28 @@ def parse_args():
     p.add_argument("--w-src-l1-max", type=float, default=1.25)
     p.add_argument("--w-sp", type=float, default=0.08)
     p.add_argument("--w-sp-min", type=float, default=0.02)
-    p.add_argument("--w-sp-max", type=float, default=0.8)
+    p.add_argument("--w-sp-max", type=float, default=0.2)
+    p.add_argument(
+        "--w-sp-step",
+        type=float,
+        default=0.03,
+        help="Additive step size for w_sp when IR-retention improvement is allowed.",
+    )
+    p.add_argument(
+        "--w-sp-decay",
+        type=float,
+        default=0.12,
+        help="Decay rate for w_sp toward baseline when IR push is not allowed.",
+    )
     p.add_argument("--sp-vis-weight", type=float, default=1.0)
     p.add_argument("--sp-ir-weight", type=float, default=2.0)
-    p.add_argument("--sp-ir-weight-max", type=float, default=4.0)
+    p.add_argument("--sp-ir-weight-max", type=float, default=3.0)
+    p.add_argument(
+        "--sp-ir-decay",
+        type=float,
+        default=0.2,
+        help="Decay rate for IR keypoint branch weight when IR push is disabled.",
+    )
     # Capacity scaling knobs for higher GPU utilization.
     p.add_argument("--base-ch", type=int, default=32)
     p.add_argument("--bottleneck-ch", type=int, default=256)
@@ -913,8 +997,12 @@ if __name__ == "__main__":
         raise ValueError("--train-ratio + --val-ratio + --test-ratio must equal 1.0")
     if args.retention_topk < 1:
         raise ValueError("--retention-topk must be >= 1")
+    if args.retention_tolerance_px < 0:
+        raise ValueError("--retention-tolerance-px must be >= 0")
     if args.retention_eval_batches == 0 or args.retention_eval_batches < -1:
         raise ValueError("--retention-eval-batches must be -1 or a positive integer")
+    if args.retention_ir_min_gain < 0:
+        raise ValueError("--retention-ir-min-gain must be >= 0")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
