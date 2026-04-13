@@ -32,6 +32,12 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = True
 
 
+def normalize_map_per_sample(x: torch.Tensor) -> torch.Tensor:
+    x_min = x.amin(dim=(-2, -1), keepdim=True)
+    x_max = x.amax(dim=(-2, -1), keepdim=True)
+    return (x - x_min) / (x_max - x_min + 1e-6)
+
+
 # =========================================================
 # DATASET
 # =========================================================
@@ -146,13 +152,16 @@ class CrossSRA(nn.Module):
             self.conv = nn.Conv2d(dim, dim, sr, sr)
             self.norm = nn.LayerNorm(dim)
 
-    def forward(self, qx, kvx, h, w):
+    def forward(self, qx, kvx, h, w, kv_bias=None):
         bsz, n, c = qx.shape
         q = self.q(qx).reshape(bsz, n, self.h, c // self.h).permute(0, 2, 1, 3)
 
         kv = kvx.permute(0, 2, 1).reshape(bsz, c, h, w)
+        kv_h, kv_w = h, w
         if self.sr > 1:
-            kv = self.conv(kv).flatten(2).transpose(1, 2)
+            kv = self.conv(kv)
+            kv_h, kv_w = kv.shape[-2], kv.shape[-1]
+            kv = kv.flatten(2).transpose(1, 2)
             kv = self.norm(kv)
         else:
             kv = kv.flatten(2).transpose(1, 2)
@@ -161,6 +170,12 @@ class CrossSRA(nn.Module):
         v = self.v(kv).reshape(bsz, -1, self.h, c // self.h).permute(0, 2, 1, 3)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        if kv_bias is not None:
+            if kv_bias.ndim == 4:
+                kv_bias = F.interpolate(kv_bias, size=(kv_h, kv_w), mode="bilinear", align_corners=False)
+                kv_bias = kv_bias.flatten(1)
+            # kv_bias: [B, N_kv] -> [B, 1, 1, N_kv], shared across heads/query tokens.
+            attn = attn + kv_bias[:, None, None, :].to(dtype=attn.dtype)
         attn = attn.softmax(dim=-1)
         x = (attn @ v).transpose(1, 2).reshape(bsz, n, c)
         return self.proj(x)
@@ -181,11 +196,13 @@ class FusionTokenBlock(nn.Module):
             nn.Linear(hidden, dim),
         )
 
-    def forward(self, vf, if_, h, w):
+    def forward(self, vf, if_, h, w, vis_bias=None, ir_bias=None, attn_bias_gamma: float = 0.0):
+        kv_bias_ir = None if ir_bias is None else (attn_bias_gamma * ir_bias)
+        kv_bias_vis = None if vis_bias is None else (attn_bias_gamma * vis_bias)
         # Cross-attention: VIS tokens query IR tokens (vis -> ir).
-        attn = torch.sigmoid(self.a) * self.v2i(vf, if_, h, w)
+        attn = torch.sigmoid(self.a) * self.v2i(vf, if_, h, w, kv_bias=kv_bias_ir)
         # Cross-attention: IR tokens query VIS tokens (ir -> vis).
-        attn = attn + torch.sigmoid(self.b) * self.i2v(if_, vf, h, w)
+        attn = attn + torch.sigmoid(self.b) * self.i2v(if_, vf, h, w, kv_bias=kv_bias_vis)
         vf = vf + attn
         vf = vf + self.ffn(self.norm(vf))
         return vf
@@ -220,6 +237,10 @@ class FusionNet(nn.Module):
         attn_sr: int = 4,
         attn_depth: int = 3,
         attn_mlp_ratio: float = 2.0,
+        gate_alpha_vis: float = 0.25,
+        gate_alpha_ir: float = 0.35,
+        attn_bias_gamma: float = 0.20,
+        attn_bias_detach: bool = True,
     ):
         super().__init__()
         if bottleneck_ch % attn_heads != 0:
@@ -246,8 +267,12 @@ class FusionNet(nn.Module):
         self.c2 = conv(base_ch + base_ch + base_ch, base_ch)
         self.up1 = up(base_ch, base_ch)
         self.out = nn.Conv2d(base_ch, 3, 3, 1, 1)
+        self.gate_alpha_vis = gate_alpha_vis
+        self.gate_alpha_ir = gate_alpha_ir
+        self.attn_bias_gamma = attn_bias_gamma
+        self.attn_bias_detach = attn_bias_detach
 
-    def forward(self, v, i):
+    def forward(self, v, i, vis_kmap=None, ir_kmap=None):
         v1 = self.v1(v)
         v2 = self.v2(v1)
         v3 = self.v3(v2)
@@ -256,13 +281,40 @@ class FusionNet(nn.Module):
         i2 = self.i2(i1)
         i3 = self.i3(i2)
 
+        if vis_kmap is not None:
+            vis_bias = F.interpolate(vis_kmap, size=v3.shape[-2:], mode="bilinear", align_corners=False)
+            if self.attn_bias_detach:
+                vis_bias = vis_bias.detach()
+            # Feature gating: boost keypoint-relevant VIS regions.
+            v3 = v3 * (1.0 + self.gate_alpha_vis * vis_bias)
+        else:
+            vis_bias = None
+
+        if ir_kmap is not None:
+            ir_bias = F.interpolate(ir_kmap, size=i3.shape[-2:], mode="bilinear", align_corners=False)
+            if self.attn_bias_detach:
+                ir_bias = ir_bias.detach()
+            # Feature gating: boost keypoint-relevant IR regions.
+            i3 = i3 * (1.0 + self.gate_alpha_ir * ir_bias)
+        else:
+            ir_bias = None
+
         bsz, c, h, w = v3.shape
         vf = v3.flatten(2).transpose(1, 2)
         if_ = i3.flatten(2).transpose(1, 2)
 
         f = vf
         for block in self.fusion_blocks:
-            f = block(f, if_, h, w)
+            # Attention logit bias uses KeyNet maps as additive logits prior.
+            f = block(
+                f,
+                if_,
+                h,
+                w,
+                vis_bias=vis_bias,
+                ir_bias=ir_bias,
+                attn_bias_gamma=self.attn_bias_gamma,
+            )
         f = f.transpose(1, 2).reshape(bsz, c, h, w)
 
         d3 = self.c3(torch.cat([self.up3(f), v2, i2], dim=1))
@@ -480,7 +532,7 @@ def evaluate_keypoint_retention(
         v = v.to(device, non_blocking=True)
         i = i.to(device, non_blocking=True)
         with torch.amp.autocast(autocast_dev, enabled=use_amp):
-            f = net(v, i)
+            f = net(v, i, keynet_detector=detector)
 
         # KeyNet expects fp32-style inputs; fused output may be fp16 from autocast.
         vg = v.mean(1, True).to(dtype=detector_dtype)
@@ -622,8 +674,9 @@ def save_epoch_previews(
 
         v = v.to(device, non_blocking=True)
         i = i.to(device, non_blocking=True)
+        vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
         with torch.amp.autocast(autocast_dev, enabled=use_amp):
-            f = net(v, i)
+            f = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
 
         v = v.detach().cpu()
         i = i.detach().cpu()
@@ -697,6 +750,10 @@ def train(args):
         attn_sr=args.attn_sr,
         attn_depth=args.attn_depth,
         attn_mlp_ratio=args.attn_mlp_ratio,
+        gate_alpha_vis=args.gate_alpha_vis,
+        gate_alpha_ir=args.gate_alpha_ir,
+        attn_bias_gamma=args.attn_bias_gamma,
+        attn_bias_detach=args.attn_bias_detach,
     ).to(device)
     loss_fn = Loss(
         w_gt_l1=args.w_gt_l1,
@@ -744,7 +801,8 @@ def train(args):
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(autocast_dev, enabled=use_amp):
-                f = net(v, i)
+                vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
+                f = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
                 loss = loss_fn(v, i, gt, f)
 
             scaler.scale(loss).backward()
@@ -763,7 +821,9 @@ def train(args):
                 i = i.to(device, non_blocking=True)
                 gt = gt.to(device, non_blocking=True)
                 with torch.amp.autocast(autocast_dev, enabled=use_amp):
-                    vloss += loss_fn(v, i, gt, net(v, i)).item()
+                    vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
+                    pred = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
+                    vloss += loss_fn(v, i, gt, pred).item()
 
         tl /= max(1, len(tr_loader))
         vloss /= max(1, len(vl_loader))
@@ -988,6 +1048,36 @@ def parse_args():
     p.add_argument("--attn-sr", type=int, default=4)
     p.add_argument("--attn-depth", type=int, default=3)
     p.add_argument("--attn-mlp-ratio", type=float, default=2.0)
+    p.add_argument(
+        "--gate-alpha-vis",
+        type=float,
+        default=0.25,
+        help="Strength of VIS feature gating from KeyNet heatmap.",
+    )
+    p.add_argument(
+        "--gate-alpha-ir",
+        type=float,
+        default=0.35,
+        help="Strength of IR feature gating from KeyNet heatmap.",
+    )
+    p.add_argument(
+        "--attn-bias-gamma",
+        type=float,
+        default=0.20,
+        help="Strength of KeyNet-derived additive bias on attention logits.",
+    )
+    p.add_argument(
+        "--attn-bias-detach",
+        dest="attn_bias_detach",
+        action="store_true",
+        help="Detach attention bias maps from gradients (recommended).",
+    )
+    p.add_argument(
+        "--no-attn-bias-detach",
+        dest="attn_bias_detach",
+        action="store_false",
+    )
+    p.set_defaults(attn_bias_detach=True)
     return p.parse_args()
 
 
