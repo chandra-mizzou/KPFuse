@@ -532,19 +532,16 @@ def evaluate_keypoint_retention(
         v = v.to(device, non_blocking=True)
         i = i.to(device, non_blocking=True)
         with torch.amp.autocast(autocast_dev, enabled=use_amp):
-            f = net(v, i, keynet_detector=detector)
+            vis_kmap, ir_kmap = compute_keypoint_maps(v, i, detector)
+            f = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
 
         # KeyNet expects fp32-style inputs; fused output may be fp16 from autocast.
-        vg = v.mean(1, True).to(dtype=detector_dtype)
-        ig = i.to(dtype=detector_dtype)
         fg = f.mean(1, True).to(dtype=detector_dtype)
-        rv = detector(vg)
-        ri = detector(ig)
+        rv = vis_kmap.to(dtype=detector_dtype)
+        ri = ir_kmap.to(dtype=detector_dtype)
         rf = detector(fg)
 
         # Response normalization reduces VIS intensity dominance.
-        rv = _normalize_response_map(rv)
-        ri = _normalize_response_map(ri)
         rf = _normalize_response_map(rf)
 
         vis_ret = _retention_from_responses(rv, rf, topk=topk, tolerance_px=tolerance_px)
@@ -647,6 +644,7 @@ def make_loaders(
 @torch.no_grad()
 def save_epoch_previews(
     net,
+    detector,
     loader,
     device,
     use_amp,
@@ -674,7 +672,7 @@ def save_epoch_previews(
 
         v = v.to(device, non_blocking=True)
         i = i.to(device, non_blocking=True)
-        vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
+        vis_kmap, ir_kmap = compute_keypoint_maps(v, i, detector)
         with torch.amp.autocast(autocast_dev, enabled=use_amp):
             f = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
 
@@ -855,6 +853,7 @@ def train(args):
 
         save_epoch_previews(
             net=net,
+            detector=loss_fn.sp.detector,
             loader=te_loader,
             device=device,
             use_amp=use_amp,
