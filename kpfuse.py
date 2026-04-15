@@ -38,6 +38,28 @@ def normalize_map_per_sample(x: torch.Tensor) -> torch.Tensor:
     return (x - x_min) / (x_max - x_min + 1e-6)
 
 
+def rgb_to_luma(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[1] != 3:
+        raise ValueError(f"Expected RGB tensor with 3 channels, got {x.shape}")
+    return (0.299 * x[:, 0:1]) + (0.587 * x[:, 1:2]) + (0.114 * x[:, 2:3])
+
+
+def gradient_mag_map(x: torch.Tensor) -> torch.Tensor:
+    dx = F.pad(x[:, :, :, 1:] - x[:, :, :, :-1], (0, 1, 0, 0))
+    dy = F.pad(x[:, :, 1:, :] - x[:, :, :-1, :], (0, 0, 0, 1))
+    return torch.sqrt((dx * dx) + (dy * dy) + 1e-6)
+
+
+def local_contrast_map(x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    if kernel_size % 2 == 0:
+        raise ValueError("kernel_size for local_contrast_map must be odd.")
+    pad = kernel_size // 2
+    mean = F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=pad)
+    mean_sq = F.avg_pool2d(x * x, kernel_size=kernel_size, stride=1, padding=pad)
+    var = (mean_sq - (mean * mean)).clamp_min(0.0)
+    return torch.sqrt(var + 1e-6)
+
+
 # =========================================================
 # DATASET
 # =========================================================
@@ -241,6 +263,18 @@ class FusionNet(nn.Module):
         gate_alpha_ir: float = 0.35,
         attn_bias_gamma: float = 0.20,
         attn_bias_detach: bool = True,
+        dark_thresh: float = 0.36,
+        dark_gain: float = 8.0,
+        quality_temp: float = 0.20,
+        vis_quality_luma_w: float = 0.55,
+        vis_quality_grad_w: float = 0.25,
+        vis_quality_kp_w: float = 0.20,
+        ir_quality_grad_w: float = 0.55,
+        ir_quality_kp_w: float = 0.45,
+        ir_priority_min: float = 0.02,
+        ir_priority_max: float = 0.95,
+        luma_pred_mix: float = 0.20,
+        pred_rgb_mix: float = 0.10,
     ):
         super().__init__()
         if bottleneck_ch % attn_heads != 0:
@@ -271,8 +305,60 @@ class FusionNet(nn.Module):
         self.gate_alpha_ir = gate_alpha_ir
         self.attn_bias_gamma = attn_bias_gamma
         self.attn_bias_detach = attn_bias_detach
+        self.dark_thresh = dark_thresh
+        self.dark_gain = dark_gain
+        self.quality_temp = quality_temp
+        self.vis_quality_luma_w = vis_quality_luma_w
+        self.vis_quality_grad_w = vis_quality_grad_w
+        self.vis_quality_kp_w = vis_quality_kp_w
+        self.ir_quality_grad_w = ir_quality_grad_w
+        self.ir_quality_kp_w = ir_quality_kp_w
+        self.ir_priority_min = ir_priority_min
+        self.ir_priority_max = ir_priority_max
+        self.luma_pred_mix = luma_pred_mix
+        self.pred_rgb_mix = pred_rgb_mix
 
-    def forward(self, v, i, vis_kmap=None, ir_kmap=None):
+    def _compute_ir_priority(self, v, i, vis_kmap=None, ir_kmap=None):
+        vis_y = rgb_to_luma(v)
+        vis_grad = normalize_map_per_sample(gradient_mag_map(vis_y))
+        ir_grad = normalize_map_per_sample(gradient_mag_map(i))
+        if vis_kmap is None:
+            vis_k = vis_grad
+        else:
+            vis_k = F.interpolate(vis_kmap, size=vis_y.shape[-2:], mode="bilinear", align_corners=False)
+            vis_k = normalize_map_per_sample(vis_k)
+        if ir_kmap is None:
+            ir_k = ir_grad
+        else:
+            ir_k = F.interpolate(ir_kmap, size=i.shape[-2:], mode="bilinear", align_corners=False)
+            ir_k = normalize_map_per_sample(ir_k)
+
+        vis_quality = (
+            (self.vis_quality_luma_w * vis_y)
+            + (self.vis_quality_grad_w * vis_grad)
+            + (self.vis_quality_kp_w * vis_k)
+        )
+        ir_quality = (self.ir_quality_grad_w * ir_grad) + (self.ir_quality_kp_w * ir_k)
+
+        # IR precedence increases in dark VIS regions and where IR quality exceeds VIS quality.
+        dark_conf = torch.sigmoid((self.dark_thresh - vis_y) * self.dark_gain)
+        quality_delta = (ir_quality - vis_quality) / max(self.quality_temp, 1e-4)
+        ir_priority = torch.sigmoid(quality_delta + ((2.0 * dark_conf) - 1.0))
+        return ir_priority.clamp(self.ir_priority_min, self.ir_priority_max)
+
+    def _adaptive_blend(self, v, i, pred_rgb, ir_priority):
+        vis_y = rgb_to_luma(v)
+        pred_y = rgb_to_luma(pred_rgb)
+        target_y = ((1.0 - ir_priority) * vis_y) + (ir_priority * i)
+        fused_y = ((1.0 - self.luma_pred_mix) * target_y) + (self.luma_pred_mix * pred_y)
+
+        # Keep VIS chroma and shift luminance/contrast via the adaptive Y-channel blend.
+        gain = (fused_y / (vis_y + 1e-4)).clamp(0.2, 3.0)
+        vis_color_preserved = (v * gain).clamp(0.0, 1.0)
+        fused_rgb = ((1.0 - self.pred_rgb_mix) * vis_color_preserved) + (self.pred_rgb_mix * pred_rgb)
+        return fused_rgb.clamp(0.0, 1.0)
+
+    def forward(self, v, i, vis_kmap=None, ir_kmap=None, return_aux: bool = False):
         v1 = self.v1(v)
         v2 = self.v2(v1)
         v3 = self.v3(v2)
@@ -320,7 +406,12 @@ class FusionNet(nn.Module):
         d3 = self.c3(torch.cat([self.up3(f), v2, i2], dim=1))
         d2 = self.c2(torch.cat([self.up2(d3), v1, i1], dim=1))
         d1 = self.up1(d2)
-        return torch.sigmoid(self.out(d1))
+        pred_rgb = torch.sigmoid(self.out(d1))
+        ir_priority = self._compute_ir_priority(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
+        fused = self._adaptive_blend(v, i, pred_rgb, ir_priority)
+        if return_aux:
+            return fused, {"ir_priority": ir_priority, "pred_rgb": pred_rgb}
+        return fused
 
 
 # =========================================================
@@ -417,6 +508,10 @@ class Loss(nn.Module):
         w_sp: float = 0.08,
         sp_vis_weight: float = 1.0,
         sp_ir_weight: float = 2.0,
+        gt_anchor: float = 0.2,
+        w_vis_luma: float = 0.9,
+        w_ir_luma: float = 1.1,
+        w_vis_contrast: float = 0.5,
     ):
         super().__init__()
         self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
@@ -426,8 +521,16 @@ class Loss(nn.Module):
         self.w_grad = w_grad
         self.w_src_l1 = w_src_l1
         self.w_sp = w_sp
+        self.gt_anchor = gt_anchor
+        self.w_vis_luma = w_vis_luma
+        self.w_ir_luma = w_ir_luma
+        self.w_vis_contrast = w_vis_contrast
 
-    def forward(self, v, i, gt, f):
+    def forward(self, v, i, gt, f, ir_priority=None):
+        if ir_priority is None:
+            ir_priority = torch.full_like(i, 0.5)
+        vis_priority = 1.0 - ir_priority
+
         src_target = torch.max(v, i.repeat(1, 3, 1, 1))
         gt_l1 = F.l1_loss(f, gt)
         src_l1 = F.l1_loss(f, src_target)
@@ -440,13 +543,28 @@ class Loss(nn.Module):
             self.sobel(f.mean(1, True)),
             self.sobel(gt.mean(1, True)),
         )
+        gt_term = (
+            (self.w_gt_l1 * gt_l1)
+            + (self.w_ssim * ssim_term)
+            + (self.w_grad * grad_term)
+        )
+
+        fused_y = rgb_to_luma(f)
+        vis_y = rgb_to_luma(v)
+        vis_luma_term = (vis_priority * (fused_y - vis_y).abs()).mean()
+        ir_luma_term = (ir_priority * (fused_y - i).abs()).mean()
+
+        fused_contrast = local_contrast_map(fused_y, kernel_size=5)
+        vis_contrast = local_contrast_map(vis_y, kernel_size=5)
+        vis_contrast_term = (vis_priority * (fused_contrast - vis_contrast).abs()).mean()
 
         sp_term = self.sp(v, i, f)
         return (
-            self.w_gt_l1 * gt_l1
-            + self.w_ssim * ssim_term
-            + self.w_grad * grad_term
+            self.gt_anchor * gt_term
             + self.w_src_l1 * src_l1
+            + self.w_vis_luma * vis_luma_term
+            + self.w_ir_luma * ir_luma_term
+            + self.w_vis_contrast * vis_contrast_term
             + self.w_sp * sp_term
         )
 
@@ -766,6 +884,18 @@ def train(args):
         gate_alpha_ir=args.gate_alpha_ir,
         attn_bias_gamma=args.attn_bias_gamma,
         attn_bias_detach=args.attn_bias_detach,
+        dark_thresh=args.dark_thresh,
+        dark_gain=args.dark_gain,
+        quality_temp=args.quality_temp,
+        vis_quality_luma_w=args.vis_quality_luma_w,
+        vis_quality_grad_w=args.vis_quality_grad_w,
+        vis_quality_kp_w=args.vis_quality_kp_w,
+        ir_quality_grad_w=args.ir_quality_grad_w,
+        ir_quality_kp_w=args.ir_quality_kp_w,
+        ir_priority_min=args.ir_priority_min,
+        ir_priority_max=args.ir_priority_max,
+        luma_pred_mix=args.luma_pred_mix,
+        pred_rgb_mix=args.pred_rgb_mix,
     ).to(device)
     loss_fn = Loss(
         w_gt_l1=args.w_gt_l1,
@@ -775,6 +905,10 @@ def train(args):
         w_sp=args.w_sp,
         sp_vis_weight=args.sp_vis_weight,
         sp_ir_weight=args.sp_ir_weight,
+        gt_anchor=args.gt_anchor,
+        w_vis_luma=args.w_vis_luma,
+        w_ir_luma=args.w_ir_luma,
+        w_vis_contrast=args.w_vis_contrast,
     ).to(device)
     loss_fn.sp.eval()
     opt = torch.optim.AdamW(
@@ -812,6 +946,8 @@ def train(args):
         print(f"Epoch {e + 1}/{args.epochs} | start: {epoch_start_ts}")
         net.train()
         tl = 0.0
+        train_ir_priority = 0.0
+        train_ir_takeover = 0.0
         for v, i, gt in tr_loader:
             v = v.to(device, non_blocking=True)
             i = i.to(device, non_blocking=True)
@@ -820,8 +956,8 @@ def train(args):
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(autocast_dev, enabled=use_amp):
                 vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
-                f = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
-                loss = loss_fn(v, i, gt, f)
+                f, aux = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
+                loss = loss_fn(v, i, gt, f, ir_priority=aux["ir_priority"])
 
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -830,9 +966,13 @@ def train(args):
             scaler.step(opt)
             scaler.update()
             tl += loss.item()
+            train_ir_priority += aux["ir_priority"].mean().item()
+            train_ir_takeover += (aux["ir_priority"] > 0.5).float().mean().item()
 
         net.eval()
         vloss = 0.0
+        val_ir_priority = 0.0
+        val_ir_takeover = 0.0
         with torch.no_grad():
             for v, i, gt in vl_loader:
                 v = v.to(device, non_blocking=True)
@@ -840,13 +980,24 @@ def train(args):
                 gt = gt.to(device, non_blocking=True)
                 with torch.amp.autocast(autocast_dev, enabled=use_amp):
                     vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
-                    pred = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
-                    vloss += loss_fn(v, i, gt, pred).item()
+                    pred, aux = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
+                    vloss += loss_fn(v, i, gt, pred, ir_priority=aux["ir_priority"]).item()
+                val_ir_priority += aux["ir_priority"].mean().item()
+                val_ir_takeover += (aux["ir_priority"] > 0.5).float().mean().item()
 
         tl /= max(1, len(tr_loader))
         vloss /= max(1, len(vl_loader))
+        train_ir_priority /= max(1, len(tr_loader))
+        train_ir_takeover /= max(1, len(tr_loader))
+        val_ir_priority /= max(1, len(vl_loader))
+        val_ir_takeover /= max(1, len(vl_loader))
         scheduler.step(vloss)
         print(f"TL={tl:.4f} VL={vloss:.4f} LR={opt.param_groups[0]['lr']:.2e}")
+        print(
+            "Modality gate | "
+            f"train_ir_priority={train_ir_priority:.3f} train_ir_takeover={train_ir_takeover:.3f} "
+            f"val_ir_priority={val_ir_priority:.3f} val_ir_takeover={val_ir_takeover:.3f}"
+        )
 
         vis_ret, ir_ret, mean_ret = evaluate_keypoint_retention(
             net=net,
@@ -1140,7 +1291,31 @@ def parse_args():
     p.add_argument("--w-gt-l1", type=float, default=1.0)
     p.add_argument("--w-ssim", type=float, default=0.9)
     p.add_argument("--w-grad", type=float, default=0.7)
+    p.add_argument(
+        "--gt-anchor",
+        type=float,
+        default=0.20,
+        help="Scales total GT supervision so GT acts as a loose reference.",
+    )
     p.add_argument("--w-src-l1", type=float, default=0.25)
+    p.add_argument(
+        "--w-vis-luma",
+        type=float,
+        default=0.9,
+        help="Penalty to keep fused luminance close to VIS where VIS is trusted.",
+    )
+    p.add_argument(
+        "--w-ir-luma",
+        type=float,
+        default=1.1,
+        help="Penalty to keep fused luminance close to IR where IR is prioritized.",
+    )
+    p.add_argument(
+        "--w-vis-contrast",
+        type=float,
+        default=0.5,
+        help="Penalty to preserve VIS local contrast in VIS-priority regions.",
+    )
     p.add_argument("--w-src-l1-min", type=float, default=0.05)
     p.add_argument("--w-src-l1-max", type=float, default=1.25)
     p.add_argument("--w-sp", type=float, default=0.08)
@@ -1193,6 +1368,43 @@ def parse_args():
         help="Strength of KeyNet-derived additive bias on attention logits.",
     )
     p.add_argument(
+        "--dark-thresh",
+        type=float,
+        default=0.36,
+        help="VIS luminance threshold below which IR gets stronger priority.",
+    )
+    p.add_argument(
+        "--dark-gain",
+        type=float,
+        default=8.0,
+        help="Steepness of low-light IR-priority activation.",
+    )
+    p.add_argument(
+        "--quality-temp",
+        type=float,
+        default=0.20,
+        help="Temperature for IR-vs-VIS quality comparison in priority gate.",
+    )
+    p.add_argument("--vis-quality-luma-w", type=float, default=0.55)
+    p.add_argument("--vis-quality-grad-w", type=float, default=0.25)
+    p.add_argument("--vis-quality-kp-w", type=float, default=0.20)
+    p.add_argument("--ir-quality-grad-w", type=float, default=0.55)
+    p.add_argument("--ir-quality-kp-w", type=float, default=0.45)
+    p.add_argument("--ir-priority-min", type=float, default=0.02)
+    p.add_argument("--ir-priority-max", type=float, default=0.95)
+    p.add_argument(
+        "--luma-pred-mix",
+        type=float,
+        default=0.20,
+        help="Blend ratio between adaptive source luminance and decoder luminance.",
+    )
+    p.add_argument(
+        "--pred-rgb-mix",
+        type=float,
+        default=0.10,
+        help="Blend ratio between VIS-color-preserved output and decoder RGB output.",
+    )
+    p.add_argument(
         "--attn-bias-detach",
         dest="attn_bias_detach",
         action="store_true",
@@ -1227,6 +1439,18 @@ if __name__ == "__main__":
         raise ValueError("--vloss-guard-tol must be >= 0")
     if args.sp_vis_weight_min <= 0:
         raise ValueError("--sp-vis-weight-min must be > 0")
+    if not (0.0 <= args.gt_anchor <= 1.0):
+        raise ValueError("--gt-anchor must be in [0, 1]")
+    if args.quality_temp <= 0:
+        raise ValueError("--quality-temp must be > 0")
+    if args.dark_gain <= 0:
+        raise ValueError("--dark-gain must be > 0")
+    if not (0.0 <= args.ir_priority_min < args.ir_priority_max <= 1.0):
+        raise ValueError("--ir-priority-min/max must satisfy 0<=min<max<=1")
+    if not (0.0 <= args.luma_pred_mix <= 1.0):
+        raise ValueError("--luma-pred-mix must be in [0, 1]")
+    if not (0.0 <= args.pred_rgb_mix <= 1.0):
+        raise ValueError("--pred-rgb-mix must be in [0, 1]")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
