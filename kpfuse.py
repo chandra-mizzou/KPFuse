@@ -60,6 +60,10 @@ def local_contrast_map(x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
     return torch.sqrt(var + 1e-6)
 
 
+def dark_confidence_map(vis_y: torch.Tensor, dark_thresh: float, dark_gain: float) -> torch.Tensor:
+    return torch.sigmoid((dark_thresh - vis_y) * dark_gain)
+
+
 # =========================================================
 # DATASET
 # =========================================================
@@ -265,6 +269,9 @@ class FusionNet(nn.Module):
         attn_bias_detach: bool = True,
         dark_thresh: float = 0.36,
         dark_gain: float = 8.0,
+        vis_conf_thresh: float = 0.42,
+        vis_conf_gain: float = 10.0,
+        ir_adv_margin: float = 0.05,
         quality_temp: float = 0.20,
         vis_quality_luma_w: float = 0.55,
         vis_quality_grad_w: float = 0.25,
@@ -272,9 +279,9 @@ class FusionNet(nn.Module):
         ir_quality_grad_w: float = 0.55,
         ir_quality_kp_w: float = 0.45,
         ir_priority_min: float = 0.02,
-        ir_priority_max: float = 0.95,
-        luma_pred_mix: float = 0.20,
-        pred_rgb_mix: float = 0.10,
+        ir_priority_max: float = 0.85,
+        luma_pred_mix: float = 0.08,
+        pred_rgb_mix: float = 0.05,
     ):
         super().__init__()
         if bottleneck_ch % attn_heads != 0:
@@ -307,6 +314,9 @@ class FusionNet(nn.Module):
         self.attn_bias_detach = attn_bias_detach
         self.dark_thresh = dark_thresh
         self.dark_gain = dark_gain
+        self.vis_conf_thresh = vis_conf_thresh
+        self.vis_conf_gain = vis_conf_gain
+        self.ir_adv_margin = ir_adv_margin
         self.quality_temp = quality_temp
         self.vis_quality_luma_w = vis_quality_luma_w
         self.vis_quality_grad_w = vis_quality_grad_w
@@ -340,10 +350,14 @@ class FusionNet(nn.Module):
         )
         ir_quality = (self.ir_quality_grad_w * ir_grad) + (self.ir_quality_kp_w * ir_k)
 
-        # IR precedence increases in dark VIS regions and where IR quality exceeds VIS quality.
+        # IR is preferred only when VIS is unreliable (dark/low-confidence)
+        # AND IR quality is better than VIS quality.
         dark_conf = torch.sigmoid((self.dark_thresh - vis_y) * self.dark_gain)
-        quality_delta = (ir_quality - vis_quality) / max(self.quality_temp, 1e-4)
-        ir_priority = torch.sigmoid(quality_delta + ((2.0 * dark_conf) - 1.0))
+        low_vis_conf = torch.sigmoid((self.vis_conf_thresh - vis_quality) * self.vis_conf_gain)
+        need_ir = torch.maximum(dark_conf, low_vis_conf)
+        quality_delta = (ir_quality - vis_quality - self.ir_adv_margin) / max(self.quality_temp, 1e-4)
+        ir_adv = torch.sigmoid(quality_delta)
+        ir_priority = need_ir * ir_adv
         return ir_priority.clamp(self.ir_priority_min, self.ir_priority_max)
 
     def _adaptive_blend(self, v, i, pred_rgb, ir_priority):
@@ -508,10 +522,10 @@ class Loss(nn.Module):
         w_sp: float = 0.08,
         sp_vis_weight: float = 1.0,
         sp_ir_weight: float = 2.0,
-        gt_anchor: float = 0.2,
-        w_vis_luma: float = 0.9,
-        w_ir_luma: float = 1.1,
-        w_vis_contrast: float = 0.5,
+        gt_anchor: float = 0.10,
+        w_vis_luma: float = 1.20,
+        w_ir_luma: float = 0.85,
+        w_vis_contrast: float = 0.80,
     ):
         super().__init__()
         self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
@@ -1324,19 +1338,19 @@ def parse_args():
     p.add_argument(
         "--w-vis-luma",
         type=float,
-        default=0.9,
+        default=1.2,
         help="Penalty to keep fused luminance close to VIS where VIS is trusted.",
     )
     p.add_argument(
         "--w-ir-luma",
         type=float,
-        default=1.1,
+        default=0.8,
         help="Penalty to keep fused luminance close to IR where IR is prioritized.",
     )
     p.add_argument(
         "--w-vis-contrast",
         type=float,
-        default=0.5,
+        default=0.8,
         help="Penalty to preserve VIS local contrast in VIS-priority regions.",
     )
     p.add_argument("--w-src-l1-min", type=float, default=0.05)
