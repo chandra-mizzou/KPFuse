@@ -792,8 +792,24 @@ def save_epoch_previews(
     epoch_dir.mkdir(parents=True, exist_ok=True)
     autocast_dev = "cuda" if device.type == "cuda" else "cpu"
 
+    ds_len = len(loader.dataset) if hasattr(loader, "dataset") else None
+    # Use a rolling contiguous preview window so each epoch visualizes
+    # different test samples instead of repeatedly saving the first batch.
+    if ds_len is not None and ds_len > 0:
+        target_count = min(max_items, ds_len)
+        if ds_len <= target_count:
+            start_idx = 0
+        else:
+            window = ds_len - target_count + 1
+            start_idx = ((epoch - 1) * target_count) % window
+        end_idx = start_idx + target_count
+    else:
+        start_idx = 0
+        end_idx = max_items
+
     net.eval()
     saved = 0
+    sample_idx = 0
     for batch in loader:
         if include_gt:
             v, i, gt = batch
@@ -816,6 +832,10 @@ def save_epoch_previews(
 
         bsz = f.shape[0]
         for bi in range(bsz):
+            in_preview_window = (start_idx <= sample_idx) and (sample_idx < end_idx)
+            sample_idx += 1
+            if not in_preview_window:
+                continue
             if saved >= max_items:
                 break
 
@@ -840,7 +860,10 @@ def save_epoch_previews(
         if saved >= max_items:
             break
 
-    print(f"Saved {saved} preview sample(s) to: {epoch_dir}")
+    print(
+        f"Saved {saved} preview sample(s) to: {epoch_dir} "
+        f"(test indices {start_idx}..{max(start_idx, end_idx - 1)})"
+    )
 
 
 def train(args):
