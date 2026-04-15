@@ -783,7 +783,13 @@ def train(args):
     os.makedirs(args.preview_dir, exist_ok=True)
     base_w_sp = args.w_sp
     base_sp_ir_weight = args.sp_ir_weight
+    base_sp_vis_weight = args.sp_vis_weight
     prev_ir_ret = None
+    prev_vis_ret = None
+    best_vloss = float("inf")
+    ema_ir_gain = 0.0
+    ema_vis_gain = 0.0
+    bad_vloss_streak = 0
 
 
     for e in range(args.epochs):
@@ -851,6 +857,12 @@ def train(args):
         else:
             cnt += 1
 
+        if vloss + args.loss_guard_delta < best_vloss:
+            best_vloss = vloss
+            bad_vloss_streak = 0
+        elif vloss > best_vloss + args.loss_guard_delta:
+            bad_vloss_streak += 1
+
         save_epoch_previews(
             net=net,
             detector=loss_fn.sp.detector,
@@ -863,73 +875,80 @@ def train(args):
             include_gt=True,
         )
 
-        # Adaptive weighting for next epoch:
-        # - improve IR retention toward target
-        # - preserve VIS retention above a floor
+        # Adaptive weighting for next epoch with dual gates:
+        # - vis_push: recover VIS retention / protect floor
+        # - ir_push: lift IR retention when VIS remains healthy
         err_ir = args.retention_target_ir - ir_ret
         err_vis = args.retention_target_vis - vis_ret
-        prev_ir_ret_old = prev_ir_ret
-        ir_gain = 0.0 if prev_ir_ret_old is None else (ir_ret - prev_ir_ret_old)
+
+        ir_gain = 0.0 if prev_ir_ret is None else (ir_ret - prev_ir_ret)
+        vis_gain = 0.0 if prev_vis_ret is None else (vis_ret - prev_vis_ret)
         prev_ir_ret = ir_ret
+        prev_vis_ret = vis_ret
 
-        allow_ir_push = (
-            err_ir > 0
-            and vis_ret >= args.retention_vis_floor
-            and (prev_ir_ret_old is None or ir_gain >= args.retention_ir_min_gain)
+        ema_ir_gain = (args.retention_ema_beta * ema_ir_gain) + ((1.0 - args.retention_ema_beta) * ir_gain)
+        ema_vis_gain = (args.retention_ema_beta * ema_vis_gain) + ((1.0 - args.retention_ema_beta) * vis_gain)
+
+        loss_guard_block = bad_vloss_streak >= args.loss_guard_patience
+        vis_push = (
+            (vis_ret < args.retention_target_vis)
+            or (vis_ret < args.retention_vis_floor)
+            or (ema_vis_gain < args.vis_gain_floor)
+        )
+        ir_push = (
+            (ir_ret < args.retention_target_ir)
+            and (vis_ret >= args.retention_vis_floor)
+            and (ema_ir_gain >= args.ir_gain_floor)
+            and not loss_guard_block
         )
 
-        sp_scale = 1.0 + (args.retention_weight_lr_ir * err_ir)
-        src_scale = 1.0 + (0.5 * args.retention_weight_lr_ir * err_ir)
-
-        # Protect strong VIS retention from dropping.
-        if vis_ret < args.retention_vis_floor:
-            vis_gap = args.retention_vis_floor - vis_ret
-            damp = max(0.55, 1.0 - (args.retention_weight_lr_vis * vis_gap))
-            sp_scale *= damp
-            src_scale *= max(0.75, damp)
-            # Also ease IR-overweight growth when VIS dips.
-            loss_fn.sp.w_ir = max(loss_fn.sp.w_vis, loss_fn.sp.w_ir * damp)
-
-        # Slow VIS-weight adjustment to keep both modalities represented.
-        vis_scale = 1.0 + (0.25 * args.retention_weight_lr_vis * err_vis)
-        loss_fn.sp.w_vis = float(min(2.0, max(0.5, loss_fn.sp.w_vis * vis_scale)))
-        # Keep IR branch emphasized but bounded.
-        ir_scale = 1.0 + (0.35 * args.retention_weight_lr_ir * err_ir)
-        loss_fn.sp.w_ir = float(
-            min(
-                args.sp_ir_weight_max,
-                max(loss_fn.sp.w_vis, loss_fn.sp.w_ir * ir_scale),
-            )
-        )
-
-        # Prevent runaway escalation of w_sp:
-        # - increase only when IR retention meaningfully improves
-        # - otherwise decay toward baseline.
-        if allow_ir_push:
-            sp_delta = args.w_sp_step * min(1.0, max(0.0, err_ir))
+        src_scale = 1.0
+        if vis_push:
+            vis_boost = min(1.0, max(0.0, args.retention_target_vis - vis_ret))
+            vis_step = args.vis_push_step * vis_boost
+            loss_fn.sp.w_vis = float(min(2.0, max(0.5, loss_fn.sp.w_vis + vis_step)))
+            src_scale += args.src_l1_vis_boost * vis_boost
         else:
-            over_base = max(0.0, loss_fn.w_sp - base_w_sp)
-            sp_delta = -args.w_sp_decay * over_base
-        loss_fn.w_sp = float(
-            min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp + sp_delta))
-        )
+            over_base_vis = max(0.0, loss_fn.sp.w_vis - base_sp_vis_weight)
+            loss_fn.sp.w_vis = float(max(0.5, loss_fn.sp.w_vis - args.vis_push_decay * over_base_vis))
+
+        if ir_push:
+            ir_boost = min(1.0, max(0.0, args.retention_target_ir - ir_ret))
+            ir_step = args.ir_push_step * ir_boost
+            loss_fn.sp.w_ir = float(min(args.sp_ir_weight_max, max(loss_fn.sp.w_vis, loss_fn.sp.w_ir + ir_step)))
+            sp_delta = args.w_sp_step * ir_boost
+            src_scale += args.src_l1_ir_boost * ir_boost
+        else:
+            over_base_ir = max(0.0, loss_fn.sp.w_ir - base_sp_ir_weight)
+            loss_fn.sp.w_ir = float(max(loss_fn.sp.w_vis, loss_fn.sp.w_ir - args.sp_ir_decay * over_base_ir))
+            over_base_sp = max(0.0, loss_fn.w_sp - base_w_sp)
+            sp_delta = -args.w_sp_decay * over_base_sp
+
+        if loss_guard_block:
+            sp_delta *= args.loss_guard_sp_damp
+            src_scale = min(src_scale, 1.0)
+
+        loss_fn.w_sp = float(min(args.w_sp_max, max(args.w_sp_min, loss_fn.w_sp + sp_delta)))
         loss_fn.w_src_l1 = float(
             min(args.w_src_l1_max, max(args.w_src_l1_min, loss_fn.w_src_l1 * src_scale))
         )
 
-        # Also keep IR branch weight from drifting too high without gains.
-        if not allow_ir_push:
-            loss_fn.sp.w_ir = float(
-                max(
-                    loss_fn.sp.w_vis,
-                    loss_fn.sp.w_ir - (args.sp_ir_decay * max(0.0, loss_fn.sp.w_ir - base_sp_ir_weight)),
-                )
-            )
         print(
-            f"Updated next-epoch weights: w_sp={loss_fn.w_sp:.4f}, "
-            f"w_src_l1={loss_fn.w_src_l1:.4f}, "
-            f"sp_vis_w={loss_fn.sp.w_vis:.3f}, sp_ir_w={loss_fn.sp.w_ir:.3f}, "
-            f"ir_gain={ir_gain:.4f}, allow_ir_push={allow_ir_push}"
+            "Adaptive control | "
+            f"vis_push={vis_push} ir_push={ir_push} "
+            f"loss_guard_block={loss_guard_block} bad_vloss_streak={bad_vloss_streak}"
+        )
+        print(
+            "Adaptive metrics | "
+            f"err_vis={err_vis:.4f} err_ir={err_ir:.4f} "
+            f"vis_gain={vis_gain:.4f} ir_gain={ir_gain:.4f} "
+            f"ema_vis_gain={ema_vis_gain:.4f} ema_ir_gain={ema_ir_gain:.4f}"
+        )
+        print(
+            "Adaptive weights | "
+            f"w_sp={loss_fn.w_sp:.4f} w_src_l1={loss_fn.w_src_l1:.4f} "
+            f"sp_vis_w={loss_fn.sp.w_vis:.3f} sp_ir_w={loss_fn.sp.w_ir:.3f} "
+            f"sp_delta={sp_delta:.5f} src_scale={src_scale:.4f}"
         )
         epoch_secs = time.perf_counter() - epoch_start
         total_secs = time.perf_counter() - run_start
@@ -1005,6 +1024,78 @@ def parse_args():
         type=float,
         default=0.001,
         help="Minimum IR-retention gain required to keep increasing w_sp.",
+    )
+    p.add_argument(
+        "--retention-vis-min-gain",
+        type=float,
+        default=0.0005,
+        help="Minimum VIS-retention gain considered as healthy trend.",
+    )
+    p.add_argument(
+        "--retention-ema-beta",
+        type=float,
+        default=0.9,
+        help="EMA smoothing factor for retention gains (0-1, higher = smoother).",
+    )
+    p.add_argument(
+        "--retention-margin-vis",
+        type=float,
+        default=0.01,
+        help="Activation margin below VIS target for vis_push.",
+    )
+    p.add_argument(
+        "--retention-margin-ir",
+        type=float,
+        default=0.01,
+        help="Activation margin below IR target for ir_push.",
+    )
+    p.add_argument(
+        "--vis-gain-floor",
+        type=float,
+        default=0.0000,
+        help="Minimum EMA VIS gain before triggering vis_push trend recovery.",
+    )
+    p.add_argument(
+        "--ir-gain-floor",
+        type=float,
+        default=-0.0005,
+        help="Minimum EMA IR gain required to keep IR push active.",
+    )
+    p.add_argument(
+        "--vloss-guard-patience",
+        type=int,
+        default=3,
+        help="Consecutive epochs of rising VL before adaptation is damped.",
+    )
+    p.add_argument(
+        "--vloss-guard-tol",
+        type=float,
+        default=0.0015,
+        help="Minimum VL increase to count toward loss guard.",
+    )
+    p.add_argument(
+        "--sp-vis-weight-min",
+        type=float,
+        default=0.8,
+        help="Lower bound for VIS keypoint branch weight during adaptation.",
+    )
+    p.add_argument(
+        "--vis-push-step",
+        type=float,
+        default=0.02,
+        help="Step size for increasing VIS keypoint branch when vis_push is active.",
+    )
+    p.add_argument(
+        "--ir-push-step",
+        type=float,
+        default=0.03,
+        help="Step size for increasing IR keypoint branch when ir_push is active.",
+    )
+    p.add_argument(
+        "--vis-push-decay",
+        type=float,
+        default=0.08,
+        help="Decay rate for VIS keypoint branch when vis_push is inactive.",
     )
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
@@ -1092,6 +1183,14 @@ if __name__ == "__main__":
         raise ValueError("--retention-eval-batches must be -1 or a positive integer")
     if args.retention_ir_min_gain < 0:
         raise ValueError("--retention-ir-min-gain must be >= 0")
+    if not (0.0 <= args.gain_ema_beta < 1.0):
+        raise ValueError("--gain-ema-beta must satisfy 0 <= beta < 1")
+    if args.vloss_guard_patience < 1:
+        raise ValueError("--vloss-guard-patience must be >= 1")
+    if args.vloss_guard_tol < 0:
+        raise ValueError("--vloss-guard-tol must be >= 0")
+    if args.sp_vis_weight_min <= 0:
+        raise ValueError("--sp-vis-weight-min must be > 0")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
