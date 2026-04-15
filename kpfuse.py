@@ -923,6 +923,9 @@ def train(args):
         attn_bias_detach=args.attn_bias_detach,
         dark_thresh=args.dark_thresh,
         dark_gain=args.dark_gain,
+        vis_conf_thresh=args.vis_conf_thresh,
+        vis_conf_gain=args.vis_conf_gain,
+        ir_adv_margin=args.ir_adv_margin,
         quality_temp=args.quality_temp,
         vis_quality_luma_w=args.vis_quality_luma_w,
         vis_quality_grad_w=args.vis_quality_grad_w,
@@ -1413,13 +1416,31 @@ def parse_args():
     p.add_argument(
         "--dark-gain",
         type=float,
-        default=8.0,
+        default=10.0,
         help="Steepness of low-light IR-priority activation.",
+    )
+    p.add_argument(
+        "--vis-conf-thresh",
+        type=float,
+        default=0.45,
+        help="VIS quality threshold below which IR fallback can activate.",
+    )
+    p.add_argument(
+        "--vis-conf-gain",
+        type=float,
+        default=11.0,
+        help="Steepness of VIS low-confidence activation for IR fallback.",
+    )
+    p.add_argument(
+        "--ir-adv-margin",
+        type=float,
+        default=0.06,
+        help="Required IR quality advantage before IR takes precedence.",
     )
     p.add_argument(
         "--quality-temp",
         type=float,
-        default=0.20,
+        default=0.22,
         help="Temperature for IR-vs-VIS quality comparison in priority gate.",
     )
     p.add_argument("--vis-quality-luma-w", type=float, default=0.55)
@@ -1428,17 +1449,17 @@ def parse_args():
     p.add_argument("--ir-quality-grad-w", type=float, default=0.55)
     p.add_argument("--ir-quality-kp-w", type=float, default=0.45)
     p.add_argument("--ir-priority-min", type=float, default=0.02)
-    p.add_argument("--ir-priority-max", type=float, default=0.95)
+    p.add_argument("--ir-priority-max", type=float, default=0.80)
     p.add_argument(
         "--luma-pred-mix",
         type=float,
-        default=0.20,
+        default=0.06,
         help="Blend ratio between adaptive source luminance and decoder luminance.",
     )
     p.add_argument(
         "--pred-rgb-mix",
         type=float,
-        default=0.10,
+        default=0.04,
         help="Blend ratio between VIS-color-preserved output and decoder RGB output.",
     )
     p.add_argument(
