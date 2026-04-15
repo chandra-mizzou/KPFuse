@@ -98,6 +98,13 @@ class FusionDataset(Dataset):
         samples,
         size: int = 256,
         augment: bool = False,
+        photometric_aug: bool = True,
+        vis_brightness_jitter: float = 0.20,
+        vis_contrast_jitter: float = 0.20,
+        ir_brightness_jitter: float = 0.20,
+        ir_contrast_jitter: float = 0.20,
+        gt_brightness_jitter: float = 0.10,
+        gt_contrast_jitter: float = 0.10,
         indices: Optional[Sequence[int]] = None,
     ):
         if indices is None:
@@ -109,11 +116,33 @@ class FusionDataset(Dataset):
             raise RuntimeError("Dataset split has no samples.")
 
         self.augment = augment
+        self.photometric_aug = photometric_aug
+        self.vis_brightness_jitter = vis_brightness_jitter
+        self.vis_contrast_jitter = vis_contrast_jitter
+        self.ir_brightness_jitter = ir_brightness_jitter
+        self.ir_contrast_jitter = ir_contrast_jitter
+        self.gt_brightness_jitter = gt_brightness_jitter
+        self.gt_contrast_jitter = gt_contrast_jitter
         self.resize = T.Resize((size, size))
         self.to_tensor = T.ToTensor()
 
     def __len__(self):
         return len(self.samples)
+
+    @staticmethod
+    def _sample_factor(jitter: float) -> float:
+        if jitter <= 0:
+            return 1.0
+        lo = max(0.0, 1.0 - jitter)
+        hi = 1.0 + jitter
+        return random.uniform(lo, hi)
+
+    def _apply_photometric(self, img: Image.Image, b_jitter: float, c_jitter: float):
+        if b_jitter > 0:
+            img = TF.adjust_brightness(img, self._sample_factor(b_jitter))
+        if c_jitter > 0:
+            img = TF.adjust_contrast(img, self._sample_factor(c_jitter))
+        return img
 
     def __getitem__(self, i):
         vp, ip, gp = self.samples[i]
@@ -132,6 +161,19 @@ class FusionDataset(Dataset):
                     v_img = TF.vflip(v_img)
                     i_img = TF.vflip(i_img)
                     g_img = TF.vflip(g_img)
+
+                # Train-only photometric jitter to improve robustness to
+                # exposure/contrast variability across sensors.
+                if self.photometric_aug:
+                    v_img = self._apply_photometric(
+                        v_img, self.vis_brightness_jitter, self.vis_contrast_jitter
+                    )
+                    i_img = self._apply_photometric(
+                        i_img, self.ir_brightness_jitter, self.ir_contrast_jitter
+                    )
+                    g_img = self._apply_photometric(
+                        g_img, self.gt_brightness_jitter, self.gt_contrast_jitter
+                    )
 
             v = self.to_tensor(v_img)
             ir = self.to_tensor(i_img)
@@ -765,6 +807,13 @@ def make_loaders(
     val_ratio,
     test_ratio,
     train_aug=True,
+    photo_aug=True,
+    vis_brightness_jitter=0.20,
+    vis_contrast_jitter=0.20,
+    ir_brightness_jitter=0.20,
+    ir_contrast_jitter=0.20,
+    gt_brightness_jitter=0.10,
+    gt_contrast_jitter=0.10,
 ):
     samples = match_triplets(vis_dir, ir_dir, gt_dir)
     n_train, n_val, n_test = _compute_split_counts(
@@ -779,7 +828,19 @@ def make_loaders(
     tr_ids = order[:n_train]
     vl_ids = order[n_train : n_train + n_val]
     te_ids = order[n_train + n_val :]
-    tr_ds = FusionDataset(samples, size=size, augment=train_aug, indices=tr_ids)
+    tr_ds = FusionDataset(
+        samples,
+        size=size,
+        augment=train_aug,
+        photometric_aug=photo_aug,
+        vis_brightness_jitter=vis_brightness_jitter,
+        vis_contrast_jitter=vis_contrast_jitter,
+        ir_brightness_jitter=ir_brightness_jitter,
+        ir_contrast_jitter=ir_contrast_jitter,
+        gt_brightness_jitter=gt_brightness_jitter,
+        gt_contrast_jitter=gt_contrast_jitter,
+        indices=tr_ids,
+    )
     vl_ds = FusionDataset(samples, size=size, augment=False, indices=vl_ids)
     te_ds = FusionDataset(samples, size=size, augment=False, indices=te_ids)
 
@@ -923,6 +984,13 @@ def train(args):
         args.val_ratio,
         args.test_ratio,
         args.train_aug,
+        args.photo_aug,
+        args.vis_brightness_jitter,
+        args.vis_contrast_jitter,
+        args.ir_brightness_jitter,
+        args.ir_contrast_jitter,
+        args.gt_brightness_jitter,
+        args.gt_contrast_jitter,
     )
     print(
         f"Matched samples: {n_samples} | "
@@ -1351,6 +1419,45 @@ def parse_args():
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
     p.set_defaults(train_aug=True)
+    p.add_argument("--photo-aug", dest="photo_aug", action="store_true")
+    p.add_argument("--no-photo-aug", dest="photo_aug", action="store_false")
+    p.set_defaults(photo_aug=True)
+    p.add_argument(
+        "--vis-brightness-jitter",
+        type=float,
+        default=0.20,
+        help="Train-only VIS brightness jitter range (factor in [1-j, 1+j]).",
+    )
+    p.add_argument(
+        "--vis-contrast-jitter",
+        type=float,
+        default=0.20,
+        help="Train-only VIS contrast jitter range (factor in [1-j, 1+j]).",
+    )
+    p.add_argument(
+        "--ir-brightness-jitter",
+        type=float,
+        default=0.20,
+        help="Train-only IR brightness jitter range (factor in [1-j, 1+j]).",
+    )
+    p.add_argument(
+        "--ir-contrast-jitter",
+        type=float,
+        default=0.20,
+        help="Train-only IR contrast jitter range (factor in [1-j, 1+j]).",
+    )
+    p.add_argument(
+        "--gt-brightness-jitter",
+        type=float,
+        default=0.10,
+        help="Train-only GT brightness jitter range (factor in [1-j, 1+j]).",
+    )
+    p.add_argument(
+        "--gt-contrast-jitter",
+        type=float,
+        default=0.10,
+        help="Train-only GT contrast jitter range (factor in [1-j, 1+j]).",
+    )
     # Rebalanced defaults after switching SSIM/gradient supervision to GT.
     p.add_argument("--w-gt-l1", type=float, default=1.0)
     p.add_argument("--w-ssim", type=float, default=0.9)
@@ -1551,6 +1658,16 @@ if __name__ == "__main__":
         raise ValueError("--sat-thresh must be in [0, 1]")
     if not (0.0 <= args.sat_ir_min <= 1.0):
         raise ValueError("--sat-ir-min must be in [0, 1]")
+    for name, value in [
+        ("--vis-brightness-jitter", args.vis_brightness_jitter),
+        ("--vis-contrast-jitter", args.vis_contrast_jitter),
+        ("--ir-brightness-jitter", args.ir_brightness_jitter),
+        ("--ir-contrast-jitter", args.ir_contrast_jitter),
+        ("--gt-brightness-jitter", args.gt_brightness_jitter),
+        ("--gt-contrast-jitter", args.gt_contrast_jitter),
+    ]:
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0")
     if not (0.0 <= args.ir_priority_min < args.ir_priority_max <= 1.0):
         raise ValueError("--ir-priority-min/max must satisfy 0<=min<max<=1")
     if not (0.0 <= args.luma_pred_mix <= 1.0):
