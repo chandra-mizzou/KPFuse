@@ -64,6 +64,14 @@ def dark_confidence_map(vis_y: torch.Tensor, dark_thresh: float, dark_gain: floa
     return torch.sigmoid((dark_thresh - vis_y) * dark_gain)
 
 
+def saturation_confidence_map(
+    vis_rgb: torch.Tensor, sat_thresh: float, sat_gain: float
+) -> torch.Tensor:
+    # Near-white clipping proxy: all RGB channels are high (close to 1.0).
+    min_rgb = vis_rgb.amin(dim=1, keepdim=True)
+    return torch.sigmoid((min_rgb - sat_thresh) * sat_gain)
+
+
 # =========================================================
 # DATASET
 # =========================================================
@@ -272,6 +280,9 @@ class FusionNet(nn.Module):
         vis_conf_thresh: float = 0.42,
         vis_conf_gain: float = 10.0,
         ir_adv_margin: float = 0.05,
+        sat_thresh: float = 0.98,
+        sat_gain: float = 24.0,
+        sat_ir_min: float = 0.40,
         quality_temp: float = 0.20,
         vis_quality_luma_w: float = 0.55,
         vis_quality_grad_w: float = 0.25,
@@ -317,6 +328,9 @@ class FusionNet(nn.Module):
         self.vis_conf_thresh = vis_conf_thresh
         self.vis_conf_gain = vis_conf_gain
         self.ir_adv_margin = ir_adv_margin
+        self.sat_thresh = sat_thresh
+        self.sat_gain = sat_gain
+        self.sat_ir_min = sat_ir_min
         self.quality_temp = quality_temp
         self.vis_quality_luma_w = vis_quality_luma_w
         self.vis_quality_grad_w = vis_quality_grad_w
@@ -358,6 +372,16 @@ class FusionNet(nn.Module):
         quality_delta = (ir_quality - vis_quality - self.ir_adv_margin) / max(self.quality_temp, 1e-4)
         ir_adv = torch.sigmoid(quality_delta)
         ir_priority = need_ir * ir_adv
+
+        # Special case: RGB saturation (near-white clipped pixels).
+        # In these regions, force a minimum IR contribution because VIS details
+        # are likely lost due to sensor saturation.
+        sat_conf = saturation_confidence_map(
+            v,
+            sat_thresh=self.sat_thresh,
+            sat_gain=self.sat_gain,
+        )
+        ir_priority = torch.maximum(ir_priority, self.sat_ir_min * sat_conf)
         return ir_priority.clamp(self.ir_priority_min, self.ir_priority_max)
 
     def _adaptive_blend(self, v, i, pred_rgb, ir_priority):
@@ -1438,6 +1462,24 @@ def parse_args():
         help="Required IR quality advantage before IR takes precedence.",
     )
     p.add_argument(
+        "--sat-thresh",
+        type=float,
+        default=0.98,
+        help="RGB saturation threshold in [0,1] (e.g., 250/255 ~= 0.98).",
+    )
+    p.add_argument(
+        "--sat-gain",
+        type=float,
+        default=24.0,
+        help="Steepness of saturation-confidence activation.",
+    )
+    p.add_argument(
+        "--sat-ir-min",
+        type=float,
+        default=0.40,
+        help="Minimum IR priority enforced in saturated RGB regions.",
+    )
+    p.add_argument(
         "--quality-temp",
         type=float,
         default=0.22,
@@ -1503,6 +1545,12 @@ if __name__ == "__main__":
         raise ValueError("--quality-temp must be > 0")
     if args.dark_gain <= 0:
         raise ValueError("--dark-gain must be > 0")
+    if args.sat_gain <= 0:
+        raise ValueError("--sat-gain must be > 0")
+    if not (0.0 <= args.sat_thresh <= 1.0):
+        raise ValueError("--sat-thresh must be in [0, 1]")
+    if not (0.0 <= args.sat_ir_min <= 1.0):
+        raise ValueError("--sat-ir-min must be in [0, 1]")
     if not (0.0 <= args.ir_priority_min < args.ir_priority_max <= 1.0):
         raise ValueError("--ir-priority-min/max must satisfy 0<=min<max<=1")
     if not (0.0 <= args.luma_pred_mix <= 1.0):
