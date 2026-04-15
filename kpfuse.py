@@ -460,6 +460,20 @@ def _normalize_response_map(x: torch.Tensor) -> torch.Tensor:
     return (x - x_min) / (x_max - x_min + 1e-6)
 
 
+@torch.no_grad()
+def compute_keypoint_maps(v: torch.Tensor, i: torch.Tensor, detector: nn.Module):
+    """Compute normalized KeyNet response maps for VIS and IR inputs."""
+    detector.eval()
+    detector_dtype = next(detector.parameters()).dtype
+    vg = v.mean(1, True).to(dtype=detector_dtype)
+    ig = i.to(dtype=detector_dtype)
+    rv = detector(vg)
+    ri = detector(ig)
+    rv = _normalize_response_map(rv)
+    ri = _normalize_response_map(ri)
+    return rv, ri
+
+
 def _retention_from_responses(
     src_resp: torch.Tensor,
     fused_resp: torch.Tensor,
@@ -857,10 +871,10 @@ def train(args):
         else:
             cnt += 1
 
-        if vloss + args.loss_guard_delta < best_vloss:
+        if vloss + args.vloss_guard_tol < best_vloss:
             best_vloss = vloss
             bad_vloss_streak = 0
-        elif vloss > best_vloss + args.loss_guard_delta:
+        elif vloss > best_vloss + args.vloss_guard_tol:
             bad_vloss_streak += 1
 
         save_epoch_previews(
@@ -889,14 +903,15 @@ def train(args):
         ema_ir_gain = (args.retention_ema_beta * ema_ir_gain) + ((1.0 - args.retention_ema_beta) * ir_gain)
         ema_vis_gain = (args.retention_ema_beta * ema_vis_gain) + ((1.0 - args.retention_ema_beta) * vis_gain)
 
-        loss_guard_block = bad_vloss_streak >= args.loss_guard_patience
+        loss_guard_block = bad_vloss_streak >= args.vloss_guard_patience
+        ir_trend_healthy = ema_ir_gain >= args.retention_ir_min_gain
         vis_push = (
-            (vis_ret < args.retention_target_vis)
+            (vis_ret < (args.retention_target_vis - args.retention_margin_vis))
             or (vis_ret < args.retention_vis_floor)
-            or (ema_vis_gain < args.vis_gain_floor)
+            or (ema_vis_gain < max(args.vis_gain_floor, args.retention_vis_min_gain))
         )
         ir_push = (
-            (ir_ret < args.retention_target_ir)
+            (ir_ret < (args.retention_target_ir - args.retention_margin_ir))
             and (vis_ret >= args.retention_vis_floor)
             and (ema_ir_gain >= args.ir_gain_floor)
             and not loss_guard_block
@@ -905,18 +920,20 @@ def train(args):
         src_scale = 1.0
         if vis_push:
             vis_boost = min(1.0, max(0.0, args.retention_target_vis - vis_ret))
-            vis_step = args.vis_push_step * vis_boost
-            loss_fn.sp.w_vis = float(min(2.0, max(0.5, loss_fn.sp.w_vis + vis_step)))
+            vis_step = args.retention_weight_lr_vis * args.vis_push_step * vis_boost
+            loss_fn.sp.w_vis = float(min(2.0, max(args.sp_vis_weight_min, loss_fn.sp.w_vis + vis_step)))
             src_scale += args.src_l1_vis_boost * vis_boost
         else:
             over_base_vis = max(0.0, loss_fn.sp.w_vis - base_sp_vis_weight)
-            loss_fn.sp.w_vis = float(max(0.5, loss_fn.sp.w_vis - args.vis_push_decay * over_base_vis))
+            loss_fn.sp.w_vis = float(
+                max(args.sp_vis_weight_min, loss_fn.sp.w_vis - args.vis_push_decay * over_base_vis)
+            )
 
         if ir_push:
             ir_boost = min(1.0, max(0.0, args.retention_target_ir - ir_ret))
-            ir_step = args.ir_push_step * ir_boost
+            ir_step = args.retention_weight_lr_ir * args.ir_push_step * ir_boost
             loss_fn.sp.w_ir = float(min(args.sp_ir_weight_max, max(loss_fn.sp.w_vis, loss_fn.sp.w_ir + ir_step)))
-            sp_delta = args.w_sp_step * ir_boost
+            sp_delta = args.w_sp_step * ir_boost if ir_trend_healthy else 0.0
             src_scale += args.src_l1_ir_boost * ir_boost
         else:
             over_base_ir = max(0.0, loss_fn.sp.w_ir - base_sp_ir_weight)
@@ -936,6 +953,7 @@ def train(args):
         print(
             "Adaptive control | "
             f"vis_push={vis_push} ir_push={ir_push} "
+            f"ir_trend_healthy={ir_trend_healthy} "
             f"loss_guard_block={loss_guard_block} bad_vloss_streak={bad_vloss_streak}"
         )
         print(
@@ -1097,6 +1115,24 @@ def parse_args():
         default=0.08,
         help="Decay rate for VIS keypoint branch when vis_push is inactive.",
     )
+    p.add_argument(
+        "--src-l1-vis-boost",
+        type=float,
+        default=0.10,
+        help="Multiplicative source-L1 boost factor when vis_push is active.",
+    )
+    p.add_argument(
+        "--src-l1-ir-boost",
+        type=float,
+        default=0.15,
+        help="Multiplicative source-L1 boost factor when ir_push is active.",
+    )
+    p.add_argument(
+        "--loss-guard-sp-damp",
+        type=float,
+        default=0.5,
+        help="Damping factor applied to SP-weight updates during validation-loss guard.",
+    )
     p.add_argument("--train-aug", dest="train_aug", action="store_true")
     p.add_argument("--no-train-aug", dest="train_aug", action="store_false")
     p.set_defaults(train_aug=True)
@@ -1183,8 +1219,8 @@ if __name__ == "__main__":
         raise ValueError("--retention-eval-batches must be -1 or a positive integer")
     if args.retention_ir_min_gain < 0:
         raise ValueError("--retention-ir-min-gain must be >= 0")
-    if not (0.0 <= args.gain_ema_beta < 1.0):
-        raise ValueError("--gain-ema-beta must satisfy 0 <= beta < 1")
+    if not (0.0 <= args.retention_ema_beta < 1.0):
+        raise ValueError("--retention-ema-beta must satisfy 0 <= beta < 1")
     if args.vloss_guard_patience < 1:
         raise ValueError("--vloss-guard-patience must be >= 1")
     if args.vloss_guard_tol < 0:
