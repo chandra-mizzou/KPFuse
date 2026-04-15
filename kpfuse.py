@@ -275,22 +275,22 @@ class FusionNet(nn.Module):
         gate_alpha_ir: float = 0.35,
         attn_bias_gamma: float = 0.20,
         attn_bias_detach: bool = True,
-        dark_thresh: float = 0.36,
-        dark_gain: float = 8.0,
-        vis_conf_thresh: float = 0.42,
-        vis_conf_gain: float = 10.0,
-        ir_adv_margin: float = 0.05,
+        dark_thresh: float = 0.45,
+        dark_gain: float = 10.0,
+        vis_conf_thresh: float = 0.55,
+        vis_conf_gain: float = 11.0,
+        ir_adv_margin: float = 0.00,
         sat_thresh: float = 0.98,
         sat_gain: float = 24.0,
-        sat_ir_min: float = 0.40,
-        quality_temp: float = 0.20,
+        sat_ir_min: float = 0.50,
+        quality_temp: float = 0.15,
         vis_quality_luma_w: float = 0.55,
         vis_quality_grad_w: float = 0.25,
         vis_quality_kp_w: float = 0.20,
         ir_quality_grad_w: float = 0.55,
         ir_quality_kp_w: float = 0.45,
-        ir_priority_min: float = 0.02,
-        ir_priority_max: float = 0.85,
+        ir_priority_min: float = 0.01,
+        ir_priority_max: float = 0.95,
         luma_pred_mix: float = 0.08,
         pred_rgb_mix: float = 0.05,
     ):
@@ -546,10 +546,10 @@ class Loss(nn.Module):
         w_sp: float = 0.08,
         sp_vis_weight: float = 1.0,
         sp_ir_weight: float = 2.0,
-        gt_anchor: float = 0.10,
-        w_vis_luma: float = 1.20,
-        w_ir_luma: float = 0.85,
-        w_vis_contrast: float = 0.80,
+        gt_anchor: float = 0.08,
+        w_vis_luma: float = 1.25,
+        w_ir_luma: float = 0.80,
+        w_vis_contrast: float = 0.85,
     ):
         super().__init__()
         self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
@@ -1255,13 +1255,13 @@ def parse_args():
     p.add_argument(
         "--retention-ir-min-gain",
         type=float,
-        default=0.001,
+        default=0.0,
         help="Minimum IR-retention gain required to keep increasing w_sp.",
     )
     p.add_argument(
         "--retention-vis-min-gain",
         type=float,
-        default=0.0005,
+        default=-0.001,
         help="Minimum VIS-retention gain considered as healthy trend.",
     )
     p.add_argument(
@@ -1285,7 +1285,7 @@ def parse_args():
     p.add_argument(
         "--vis-gain-floor",
         type=float,
-        default=0.0000,
+        default=-0.0010,
         help="Minimum EMA VIS gain before triggering vis_push trend recovery.",
     )
     p.add_argument(
@@ -1333,13 +1333,13 @@ def parse_args():
     p.add_argument(
         "--src-l1-vis-boost",
         type=float,
-        default=0.10,
+        default=0.0,
         help="Multiplicative source-L1 boost factor when vis_push is active.",
     )
     p.add_argument(
         "--src-l1-ir-boost",
         type=float,
-        default=0.15,
+        default=0.05,
         help="Multiplicative source-L1 boost factor when ir_push is active.",
     )
     p.add_argument(
@@ -1358,14 +1358,14 @@ def parse_args():
     p.add_argument(
         "--gt-anchor",
         type=float,
-        default=0.20,
+        default=0.08,
         help="Scales total GT supervision so GT acts as a loose reference.",
     )
     p.add_argument("--w-src-l1", type=float, default=0.25)
     p.add_argument(
         "--w-vis-luma",
         type=float,
-        default=1.2,
+        default=1.25,
         help="Penalty to keep fused luminance close to VIS where VIS is trusted.",
     )
     p.add_argument(
@@ -1377,11 +1377,11 @@ def parse_args():
     p.add_argument(
         "--w-vis-contrast",
         type=float,
-        default=0.8,
+        default=0.85,
         help="Penalty to preserve VIS local contrast in VIS-priority regions.",
     )
     p.add_argument("--w-src-l1-min", type=float, default=0.05)
-    p.add_argument("--w-src-l1-max", type=float, default=1.25)
+    p.add_argument("--w-src-l1-max", type=float, default=0.45)
     p.add_argument("--w-sp", type=float, default=0.08)
     p.add_argument("--w-sp-min", type=float, default=0.02)
     p.add_argument("--w-sp-max", type=float, default=0.2)
@@ -1434,7 +1434,7 @@ def parse_args():
     p.add_argument(
         "--dark-thresh",
         type=float,
-        default=0.36,
+        default=0.45,
         help="VIS luminance threshold below which IR gets stronger priority.",
     )
     p.add_argument(
@@ -1446,7 +1446,7 @@ def parse_args():
     p.add_argument(
         "--vis-conf-thresh",
         type=float,
-        default=0.45,
+        default=0.55,
         help="VIS quality threshold below which IR fallback can activate.",
     )
     p.add_argument(
@@ -1458,7 +1458,7 @@ def parse_args():
     p.add_argument(
         "--ir-adv-margin",
         type=float,
-        default=0.06,
+        default=0.00,
         help="Required IR quality advantage before IR takes precedence.",
     )
     p.add_argument(
@@ -1476,13 +1476,13 @@ def parse_args():
     p.add_argument(
         "--sat-ir-min",
         type=float,
-        default=0.40,
+        default=0.50,
         help="Minimum IR priority enforced in saturated RGB regions.",
     )
     p.add_argument(
         "--quality-temp",
         type=float,
-        default=0.22,
+        default=0.15,
         help="Temperature for IR-vs-VIS quality comparison in priority gate.",
     )
     p.add_argument("--vis-quality-luma-w", type=float, default=0.55)
@@ -1490,8 +1490,8 @@ def parse_args():
     p.add_argument("--vis-quality-kp-w", type=float, default=0.20)
     p.add_argument("--ir-quality-grad-w", type=float, default=0.55)
     p.add_argument("--ir-quality-kp-w", type=float, default=0.45)
-    p.add_argument("--ir-priority-min", type=float, default=0.02)
-    p.add_argument("--ir-priority-max", type=float, default=0.80)
+    p.add_argument("--ir-priority-min", type=float, default=0.01)
+    p.add_argument("--ir-priority-max", type=float, default=0.95)
     p.add_argument(
         "--luma-pred-mix",
         type=float,
