@@ -26,6 +26,38 @@ def build_stem_map(files: Sequence[Path]) -> Dict[str, Path]:
     return out
 
 
+def resolve_child_dir(parent: Path, desired_name: str) -> Path:
+    """Return child dir matching desired_name, case-insensitive if needed."""
+    direct = parent / desired_name
+    if direct.is_dir():
+        return direct
+    desired_cf = desired_name.casefold()
+    for child in parent.iterdir():
+        if child.is_dir() and child.name.casefold() == desired_cf:
+            return child
+    return direct
+
+
+def discover_dataset_dirs(
+    datasets_root: Path,
+    dataset_names: Sequence[str],
+    vis_dirname: str,
+    ir_dirname: str,
+) -> List[Tuple[str, Path, Path]]:
+    out: List[Tuple[str, Path, Path]] = []
+    if dataset_names:
+        candidate_dirs = [(name, datasets_root / name) for name in dataset_names]
+    else:
+        candidate_dirs = [(p.name, p) for p in sorted(datasets_root.iterdir()) if p.is_dir()]
+
+    for ds_name, ds_dir in candidate_dirs:
+        vis_dir = resolve_child_dir(ds_dir, vis_dirname)
+        ir_dir = resolve_child_dir(ds_dir, ir_dirname)
+        if vis_dir.is_dir() and ir_dir.is_dir():
+            out.append((ds_name, vis_dir, ir_dir))
+    return out
+
+
 def normalize_map(x: torch.Tensor) -> torch.Tensor:
     x_min = x.amin(dim=(-2, -1), keepdim=True)
     x_max = x.amax(dim=(-2, -1), keepdim=True)
@@ -183,8 +215,20 @@ def parse_args():
     p.add_argument(
         "--dataset-names",
         nargs="*",
-        default=[f"dataset{i}" for i in range(1, 7)],
-        help="Dataset folder names under datasets-root (default: dataset1..dataset6)",
+        default=[],
+        help="Optional dataset folder names under datasets-root (default: auto-discover valid dataset folders)",
+    )
+    p.add_argument(
+        "--vis-dirname",
+        type=str,
+        default="vi",
+        help="VIS subfolder name under each dataset (case-insensitive match supported).",
+    )
+    p.add_argument(
+        "--ir-dirname",
+        type=str,
+        default="ir",
+        help="IR subfolder name under each dataset (case-insensitive match supported).",
     )
     p.add_argument(
         "--fused-subdir",
@@ -223,13 +267,19 @@ def main():
     detector = KeyNetResponse().to(device).eval()
     print(f"[info] device={device}, models={len(model_dirs)}")
 
-    for dataset_name in args.dataset_names:
-        ds_dir = datasets_root / dataset_name
-        vis_dir = ds_dir / "vi"
-        ir_dir = ds_dir / "ir"
-        if not vis_dir.is_dir() or not ir_dir.is_dir():
-            print(f"[skip] {dataset_name}: missing vi/ir under {ds_dir}")
-            continue
+    dataset_specs = discover_dataset_dirs(
+        datasets_root=datasets_root,
+        dataset_names=args.dataset_names,
+        vis_dirname=args.vis_dirname,
+        ir_dirname=args.ir_dirname,
+    )
+    if not dataset_specs:
+        raise RuntimeError(
+            f"No valid datasets found under {datasets_root} with subfolders "
+            f"{args.vis_dirname!r}/{args.ir_dirname!r}"
+        )
+
+    for dataset_name, vis_dir, ir_dir in dataset_specs:
 
         rows: List[Dict[str, str]] = []
         print(f"[dataset] {dataset_name}")
