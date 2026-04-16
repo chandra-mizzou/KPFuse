@@ -69,6 +69,7 @@ def retention_from_responses(
     fused_resp: torch.Tensor,
     topk: int,
     tolerance_px: int,
+    fused_multiplier: int = 1,
 ) -> torch.Tensor:
     if fused_resp.shape[-2:] != src_resp.shape[-2:]:
         fused_resp = F.interpolate(
@@ -81,12 +82,13 @@ def retention_from_responses(
     bsz, ch, h, w = src_resp.shape
     src_flat = src_resp.flatten(1)
     fused_flat = fused_resp.flatten(1)
-    k = min(topk, src_flat.shape[1], fused_flat.shape[1])
-    if k < 1:
+    k_src = min(topk, src_flat.shape[1])
+    k_fused = min(topk * max(1, fused_multiplier), fused_flat.shape[1])
+    if k_src < 1 or k_fused < 1:
         raise ValueError("topk must be >= 1")
 
-    src_idx = src_flat.topk(k=k, dim=1).indices
-    fused_idx = fused_flat.topk(k=k, dim=1).indices
+    src_idx = src_flat.topk(k=k_src, dim=1).indices
+    fused_idx = fused_flat.topk(k=k_fused, dim=1).indices
 
     src_mask = torch.zeros_like(src_flat, dtype=torch.float32)
     fused_mask = torch.zeros_like(fused_flat, dtype=torch.float32)
@@ -107,6 +109,67 @@ def retention_from_responses(
 
     inter = (src_mask * (fused_mask > 0).float()).flatten(1).sum(dim=1)
     denom = src_mask.flatten(1).sum(dim=1).clamp_min(1.0)
+    return inter / denom
+
+
+def union_coverage_from_responses(
+    vis_resp: torch.Tensor,
+    ir_resp: torch.Tensor,
+    fused_resp: torch.Tensor,
+    topk: int,
+    tolerance_px: int,
+    fused_multiplier: int = 1,
+) -> torch.Tensor:
+    """Coverage of (VIS top-k U IR top-k) by fused top-k (or top-2k)."""
+    if ir_resp.shape[-2:] != vis_resp.shape[-2:]:
+        ir_resp = F.interpolate(
+            ir_resp,
+            size=vis_resp.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    if fused_resp.shape[-2:] != vis_resp.shape[-2:]:
+        fused_resp = F.interpolate(
+            fused_resp,
+            size=vis_resp.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    bsz, ch, h, w = vis_resp.shape
+    vis_flat = vis_resp.flatten(1)
+    ir_flat = ir_resp.flatten(1)
+    fused_flat = fused_resp.flatten(1)
+
+    k_src = min(topk, vis_flat.shape[1], ir_flat.shape[1])
+    k_fused = min(topk * max(1, fused_multiplier), fused_flat.shape[1])
+    if k_src < 1 or k_fused < 1:
+        raise ValueError("topk must be >= 1")
+
+    vis_idx = vis_flat.topk(k=k_src, dim=1).indices
+    ir_idx = ir_flat.topk(k=k_src, dim=1).indices
+    fused_idx = fused_flat.topk(k=k_fused, dim=1).indices
+
+    src_union = torch.zeros_like(vis_flat, dtype=torch.float32)
+    fused_mask = torch.zeros_like(fused_flat, dtype=torch.float32)
+    src_union.scatter_(1, vis_idx, 1.0)
+    src_union.scatter_(1, ir_idx, 1.0)
+    fused_mask.scatter_(1, fused_idx, 1.0)
+
+    src_union = src_union.view(bsz, ch, h, w)
+    fused_mask = fused_mask.view(bsz, ch, h, w)
+
+    if tolerance_px > 0:
+        kernel = (2 * tolerance_px) + 1
+        fused_mask = F.max_pool2d(
+            fused_mask,
+            kernel_size=kernel,
+            stride=1,
+            padding=tolerance_px,
+        )
+
+    inter = (src_union * (fused_mask > 0).float()).flatten(1).sum(dim=1)
+    denom = src_union.flatten(1).sum(dim=1).clamp_min(1.0)
     return inter / denom
 
 
@@ -133,17 +196,32 @@ def evaluate_dataset_model(
     device: torch.device,
     topk: int,
     tolerance_px: int,
-) -> Tuple[float, float, float, int]:
+    fused_top2k_multiplier: int,
+) -> Tuple[float, float, float, float, float, float, float, float, int]:
     vis_map = build_stem_map(list_images(vis_dir))
     ir_map = build_stem_map(list_images(ir_dir))
     fused_map = build_stem_map(list_images(fused_dir))
     common_stems = sorted(set(vis_map.keys()) & set(ir_map.keys()) & set(fused_map.keys()))
     if not common_stems:
-        return float("nan"), float("nan"), float("nan"), 0
+        return (
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            0,
+        )
 
     detector_dtype = next(detector.parameters()).dtype
     sum_vis = 0.0
     sum_ir = 0.0
+    sum_vis_2k = 0.0
+    sum_ir_2k = 0.0
+    sum_union = 0.0
+    sum_union_2k = 0.0
 
     for stem in common_stems:
         v, i, f = load_triplet_tensors(
@@ -157,16 +235,67 @@ def evaluate_dataset_model(
         ri = normalize_map(detector(i))
         rf = normalize_map(detector(f.mean(1, True)))
 
-        vis_ret = retention_from_responses(rv, rf, topk=topk, tolerance_px=tolerance_px)
-        ir_ret = retention_from_responses(ri, rf, topk=topk, tolerance_px=tolerance_px)
+        vis_ret = retention_from_responses(
+            rv,
+            rf,
+            topk=topk,
+            tolerance_px=tolerance_px,
+            fused_multiplier=1,
+        )
+        ir_ret = retention_from_responses(
+            ri,
+            rf,
+            topk=topk,
+            tolerance_px=tolerance_px,
+            fused_multiplier=1,
+        )
+        vis_ret_2k = retention_from_responses(
+            rv,
+            rf,
+            topk=topk,
+            tolerance_px=tolerance_px,
+            fused_multiplier=fused_top2k_multiplier,
+        )
+        ir_ret_2k = retention_from_responses(
+            ri,
+            rf,
+            topk=topk,
+            tolerance_px=tolerance_px,
+            fused_multiplier=fused_top2k_multiplier,
+        )
+        union_cov = union_coverage_from_responses(
+            rv,
+            ri,
+            rf,
+            topk=topk,
+            tolerance_px=tolerance_px,
+            fused_multiplier=1,
+        )
+        union_cov_2k = union_coverage_from_responses(
+            rv,
+            ri,
+            rf,
+            topk=topk,
+            tolerance_px=tolerance_px,
+            fused_multiplier=fused_top2k_multiplier,
+        )
         sum_vis += vis_ret.item()
         sum_ir += ir_ret.item()
+        sum_vis_2k += vis_ret_2k.item()
+        sum_ir_2k += ir_ret_2k.item()
+        sum_union += union_cov.item()
+        sum_union_2k += union_cov_2k.item()
 
     n = len(common_stems)
     vis_avg = sum_vis / n
     ir_avg = sum_ir / n
     mean_avg = 0.5 * (vis_avg + ir_avg)
-    return vis_avg, ir_avg, mean_avg, n
+    vis_avg_2k = sum_vis_2k / n
+    ir_avg_2k = sum_ir_2k / n
+    mean_avg_2k = 0.5 * (vis_avg_2k + ir_avg_2k)
+    union_avg = sum_union / n
+    union_avg_2k = sum_union_2k / n
+    return vis_avg, ir_avg, mean_avg, vis_avg_2k, ir_avg_2k, mean_avg_2k, union_avg, union_avg_2k, n
 
 
 def format_float(x: float) -> str:
@@ -183,6 +312,11 @@ def write_table_csv(csv_path: Path, rows: List[Dict[str, str]]) -> None:
         "Avg VIS-Fused Retention",
         "Avg IR-Fused Retention",
         "Avg Retention",
+        "Avg VIS-Fused Retention (Top2K)",
+        "Avg IR-Fused Retention (Top2K)",
+        "Avg Retention (Top2K)",
+        "Avg Union Coverage",
+        "Avg Union Coverage (Top2K)",
         "Matched Pairs",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -199,6 +333,11 @@ def write_table_markdown(md_path: Path, rows: List[Dict[str, str]], dataset_name
         "Avg VIS-Fused Retention",
         "Avg IR-Fused Retention",
         "Avg Retention",
+        "Avg VIS-Fused Retention (Top2K)",
+        "Avg IR-Fused Retention (Top2K)",
+        "Avg Retention (Top2K)",
+        "Avg Union Coverage",
+        "Avg Union Coverage (Top2K)",
         "Matched Pairs",
     ]
     lines = [f"# {dataset_name}", "", "| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
@@ -248,6 +387,12 @@ def parse_args():
     )
     p.add_argument("--topk", type=int, default=180)
     p.add_argument("--tolerance-px", type=int, default=3)
+    p.add_argument(
+        "--fused-top2k-multiplier",
+        type=int,
+        default=2,
+        help="Fused top-k multiplier for Top2K retention/union metrics (default: 2).",
+    )
     p.add_argument("--expected-model-count", type=int, default=13, help="Warn if discovered model folders differ")
     p.add_argument("--device", type=str, default=None, help="cuda, cpu, or auto (default)")
     return p.parse_args()
@@ -313,9 +458,24 @@ def main():
                 vis_avg = float("nan")
                 ir_avg = float("nan")
                 mean_avg = float("nan")
+                vis_avg_2k = float("nan")
+                ir_avg_2k = float("nan")
+                mean_avg_2k = float("nan")
+                union_avg = float("nan")
+                union_avg_2k = float("nan")
                 matched = 0
             else:
-                vis_avg, ir_avg, mean_avg, matched = evaluate_dataset_model(
+                (
+                    vis_avg,
+                    ir_avg,
+                    mean_avg,
+                    vis_avg_2k,
+                    ir_avg_2k,
+                    mean_avg_2k,
+                    union_avg,
+                    union_avg_2k,
+                    matched,
+                ) = evaluate_dataset_model(
                     detector=detector,
                     vis_dir=vis_dir,
                     ir_dir=ir_dir,
@@ -323,6 +483,7 @@ def main():
                     device=device,
                     topk=args.topk,
                     tolerance_px=args.tolerance_px,
+                    fused_top2k_multiplier=args.fused_top2k_multiplier,
                 )
 
             row = {
@@ -332,6 +493,11 @@ def main():
                 "Avg VIS-Fused Retention": format_float(vis_avg),
                 "Avg IR-Fused Retention": format_float(ir_avg),
                 "Avg Retention": format_float(mean_avg),
+                "Avg VIS-Fused Retention (Top2K)": format_float(vis_avg_2k),
+                "Avg IR-Fused Retention (Top2K)": format_float(ir_avg_2k),
+                "Avg Retention (Top2K)": format_float(mean_avg_2k),
+                "Avg Union Coverage": format_float(union_avg),
+                "Avg Union Coverage (Top2K)": format_float(union_avg_2k),
                 "Matched Pairs": str(matched),
             }
             rows.append(row)
@@ -340,6 +506,9 @@ def main():
                 f"vis={row['Avg VIS-Fused Retention']} "
                 f"ir={row['Avg IR-Fused Retention']} "
                 f"mean={row['Avg Retention']} "
+                f"mean2k={row['Avg Retention (Top2K)']} "
+                f"union={row['Avg Union Coverage']} "
+                f"union2k={row['Avg Union Coverage (Top2K)']} "
                 f"pairs={matched}"
             )
 
