@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional, Sequence
 from datetime import datetime
@@ -98,6 +99,8 @@ class FusionDataset(Dataset):
         samples,
         size: int = 256,
         augment: bool = False,
+        native_res: bool = False,
+        max_side: int = 0,
         photometric_aug: bool = True,
         vis_brightness_jitter: float = 0.20,
         vis_contrast_jitter: float = 0.20,
@@ -117,6 +120,8 @@ class FusionDataset(Dataset):
             raise RuntimeError("Dataset split has no samples.")
 
         self.augment = augment
+        self.native_res = native_res
+        self.max_side = max_side
         self.photometric_aug = photometric_aug
         self.vis_brightness_jitter = vis_brightness_jitter
         self.vis_contrast_jitter = vis_contrast_jitter
@@ -146,12 +151,36 @@ class FusionDataset(Dataset):
             img = TF.adjust_contrast(img, self._sample_factor(c_jitter))
         return img
 
+    def _maybe_resize_native(
+        self, v_img: Image.Image, i_img: Image.Image, g_img: Image.Image
+    ) -> tuple[Image.Image, Image.Image, Image.Image]:
+        if self.max_side <= 0:
+            return v_img, i_img, g_img
+        w, h = v_img.size
+        cur_side = max(h, w)
+        if cur_side <= self.max_side:
+            return v_img, i_img, g_img
+        scale = self.max_side / float(cur_side)
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        out_size = [new_h, new_w]
+        v_img = TF.resize(v_img, out_size)
+        i_img = TF.resize(i_img, out_size)
+        g_img = TF.resize(g_img, out_size)
+        return v_img, i_img, g_img
+
     def __getitem__(self, i):
         vp, ip, gp = self.samples[i]
         with Image.open(vp) as v_img, Image.open(ip) as i_img, Image.open(gp) as g_img:
-            v_img = self.resize(v_img.convert("RGB"))
-            i_img = self.resize(i_img.convert("L"))
-            g_img = self.resize(g_img.convert("RGB"))
+            v_img = v_img.convert("RGB")
+            i_img = i_img.convert("L")
+            g_img = g_img.convert("RGB")
+            if self.native_res:
+                v_img, i_img, g_img = self._maybe_resize_native(v_img, i_img, g_img)
+            else:
+                v_img = self.resize(v_img)
+                i_img = self.resize(i_img)
+                g_img = self.resize(g_img)
 
             # Apply the exact same geometric augmentation to all modalities.
             if self.augment:
@@ -192,6 +221,41 @@ class FusionDataset(Dataset):
             ir = self.to_tensor(i_img)
             gt = self.to_tensor(g_img)
         return v, ir, gt
+
+
+def _pad_image_and_mask(
+    img: torch.Tensor, target_h: int, target_w: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, h, w = img.shape
+    pad_h = target_h - h
+    pad_w = target_w - w
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError("Target padding size must be >= current tensor size.")
+    pad = (0, pad_w, 0, pad_h)
+    img = F.pad(img, pad, mode="constant", value=0.0)
+    mask = torch.ones((1, h, w), dtype=img.dtype)
+    mask = F.pad(mask, pad, mode="constant", value=0.0)
+    return img, mask
+
+
+def native_pad_collate(batch, pad_multiple: int = 8):
+    vs, is_, gts = zip(*batch)
+    max_h = max(v.shape[1] for v in vs)
+    max_w = max(v.shape[2] for v in vs)
+    if pad_multiple > 1:
+        max_h = ((max_h + pad_multiple - 1) // pad_multiple) * pad_multiple
+        max_w = ((max_w + pad_multiple - 1) // pad_multiple) * pad_multiple
+
+    v_out, i_out, gt_out, m_out = [], [], [], []
+    for v, i, gt in zip(vs, is_, gts):
+        v_pad, mask = _pad_image_and_mask(v, max_h, max_w)
+        i_pad, _ = _pad_image_and_mask(i, max_h, max_w)
+        gt_pad, _ = _pad_image_and_mask(gt, max_h, max_w)
+        v_out.append(v_pad)
+        i_out.append(i_pad)
+        gt_out.append(gt_pad)
+        m_out.append(mask)
+    return torch.stack(v_out, dim=0), torch.stack(i_out, dim=0), torch.stack(gt_out, dim=0), torch.stack(m_out, dim=0)
 
 
 def match_pairs(vis_dir: str, ir_dir: str):
@@ -555,7 +619,18 @@ class KeyNetLoss(nn.Module):
         x_max = x.amax(dim=(-2, -1), keepdim=True)
         return (x - x_min) / (x_max - x_min + 1e-6)
 
-    def forward(self, v, i, f):
+    @staticmethod
+    def _masked_l1(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        diff = (a - b).abs()
+        if mask is None:
+            return diff.mean()
+        if mask.shape[-2:] != diff.shape[-2:]:
+            mask = F.interpolate(mask, size=diff.shape[-2:], mode="nearest")
+        mask = mask.to(dtype=diff.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (diff * mask).sum() / denom
+
+    def forward(self, v, i, f, valid_mask: Optional[torch.Tensor] = None):
         detector_dtype = next(self.detector.parameters()).dtype
         v = v.mean(1, True).to(dtype=detector_dtype)
         i = i.to(dtype=detector_dtype)
@@ -574,8 +649,8 @@ class KeyNetLoss(nn.Module):
         ri = self._normalize_map(ri)
         rf = self._normalize_map(rf)
 
-        vis_term = F.l1_loss(rf, rv)
-        ir_term = F.l1_loss(rf, ri)
+        vis_term = self._masked_l1(rf, rv, valid_mask)
+        ir_term = self._masked_l1(rf, ri, valid_mask)
         return (self.w_vis * vis_term) + (self.w_ir * ir_term)
 
 
@@ -626,7 +701,19 @@ class Loss(nn.Module):
         self.w_union = w_union
 
     @staticmethod
-    def _union_keypoint_l1(v: torch.Tensor, i: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+    def _masked_mean(x: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if valid_mask is None:
+            return x.mean()
+        if valid_mask.shape[-2:] != x.shape[-2:]:
+            valid_mask = F.interpolate(valid_mask, size=x.shape[-2:], mode="nearest")
+        valid_mask = valid_mask.to(dtype=x.dtype)
+        denom = valid_mask.sum().clamp_min(1.0)
+        return (x * valid_mask).sum() / denom
+
+    @staticmethod
+    def _union_keypoint_l1(
+        v: torch.Tensor, i: torch.Tensor, f: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Encourage fused map to preserve keypoints present in either source."""
         vis_y = rgb_to_luma(v)
         fused_y = rgb_to_luma(f)
@@ -634,24 +721,29 @@ class Loss(nn.Module):
         ir_grad = normalize_map_per_sample(gradient_mag_map(i))
         fused_grad = normalize_map_per_sample(gradient_mag_map(fused_y))
         union_src = torch.maximum(vis_grad, ir_grad)
-        return F.l1_loss(fused_grad, union_src)
+        return Loss._masked_mean((fused_grad - union_src).abs(), valid_mask)
 
-    def forward(self, v, i, gt, f, ir_priority=None):
+    def forward(self, v, i, gt, f, ir_priority=None, valid_mask: Optional[torch.Tensor] = None):
         if ir_priority is None:
             ir_priority = torch.full_like(i, 0.5)
         vis_priority = 1.0 - ir_priority
 
         src_target = torch.max(v, i.repeat(1, 3, 1, 1))
-        gt_l1 = F.l1_loss(f, gt)
-        src_l1 = F.l1_loss(f, src_target)
+        gt_l1 = self._masked_mean((f - gt).abs(), valid_mask)
+        src_l1 = self._masked_mean((f - src_target).abs(), valid_mask)
 
         ssim_term = K.losses.ssim_loss(f, gt, window_size=11)
-        if ssim_term.ndim > 0:
+        if ssim_term.ndim >= 4:
+            ssim_term = self._masked_mean(ssim_term, valid_mask)
+        elif ssim_term.ndim > 0:
             ssim_term = ssim_term.mean()
 
-        grad_term = F.l1_loss(
-            self.sobel(f.mean(1, True)),
-            self.sobel(gt.mean(1, True)),
+        grad_term = self._masked_mean(
+            (
+                self.sobel(f.mean(1, True))
+                - self.sobel(gt.mean(1, True))
+            ).abs(),
+            valid_mask,
         )
         gt_term = (
             (self.w_gt_l1 * gt_l1)
@@ -661,15 +753,17 @@ class Loss(nn.Module):
 
         fused_y = rgb_to_luma(f)
         vis_y = rgb_to_luma(v)
-        vis_luma_term = (vis_priority * (fused_y - vis_y).abs()).mean()
-        ir_luma_term = (ir_priority * (fused_y - i).abs()).mean()
+        vis_luma_term = self._masked_mean(vis_priority * (fused_y - vis_y).abs(), valid_mask)
+        ir_luma_term = self._masked_mean(ir_priority * (fused_y - i).abs(), valid_mask)
 
         fused_contrast = local_contrast_map(fused_y, kernel_size=5)
         vis_contrast = local_contrast_map(vis_y, kernel_size=5)
-        vis_contrast_term = (vis_priority * (fused_contrast - vis_contrast).abs()).mean()
-        union_term = self._union_keypoint_l1(v, i, f)
+        vis_contrast_term = self._masked_mean(
+            vis_priority * (fused_contrast - vis_contrast).abs(), valid_mask
+        )
+        union_term = self._union_keypoint_l1(v, i, f, valid_mask=valid_mask)
 
-        sp_term = self.sp(v, i, f)
+        sp_term = self.sp(v, i, f, valid_mask=valid_mask)
         return (
             self.gt_anchor * gt_term
             + self.w_src_l1 * src_l1
@@ -814,7 +908,11 @@ def evaluate_keypoint_retention(
     sum_ir = 0.0
     n = 0
 
-    for bi, (v, i, _gt) in enumerate(loader):
+    for bi, batch in enumerate(loader):
+        if len(batch) == 4:
+            v, i, _gt, _mask = batch
+        else:
+            v, i, _gt = batch
         if max_batches > 0 and bi >= max_batches:
             break
 
@@ -884,6 +982,9 @@ def make_loaders(
     val_ratio,
     test_ratio,
     train_aug=True,
+    native_res_train=False,
+    pad_multiple=8,
+    max_train_side=0,
     photo_aug=True,
     vis_brightness_jitter=0.20,
     vis_contrast_jitter=0.20,
@@ -909,6 +1010,8 @@ def make_loaders(
         samples,
         size=size,
         augment=train_aug,
+        native_res=native_res_train,
+        max_side=max_train_side,
         photometric_aug=photo_aug,
         vis_brightness_jitter=vis_brightness_jitter,
         vis_contrast_jitter=vis_contrast_jitter,
@@ -921,6 +1024,12 @@ def make_loaders(
     vl_ds = FusionDataset(samples, size=size, augment=False, indices=vl_ids)
     te_ds = FusionDataset(samples, size=size, augment=False, indices=te_ids)
 
+    tr_collate = (
+        partial(native_pad_collate, pad_multiple=pad_multiple)
+        if native_res_train
+        else None
+    )
+
     pin = torch.cuda.is_available()
     tr_loader = DataLoader(
         tr_ds,
@@ -929,6 +1038,7 @@ def make_loaders(
         num_workers=workers,
         pin_memory=pin,
         persistent_workers=workers > 0,
+        collate_fn=tr_collate,
     )
     vl_loader = DataLoader(
         vl_ds,
@@ -988,7 +1098,10 @@ def save_epoch_previews(
     sample_idx = 0
     for batch in loader:
         if include_gt:
-            v, i, gt = batch
+            if len(batch) == 4:
+                v, i, gt, _mask = batch
+            else:
+                v, i, gt = batch
             names = None
         else:
             v, i, names = batch
@@ -1164,6 +1277,9 @@ def train(args):
         args.val_ratio,
         args.test_ratio,
         args.train_aug,
+        args.native_res_train,
+        args.pad_multiple,
+        args.max_train_side,
         args.photo_aug,
         args.vis_brightness_jitter,
         args.vis_contrast_jitter,
@@ -1172,6 +1288,11 @@ def train(args):
         args.gt_brightness_jitter,
         args.gt_contrast_jitter,
     )
+    if args.native_res_train:
+        print(
+            "Native-resolution train mode: enabled | "
+            f"pad_multiple={args.pad_multiple} max_train_side={args.max_train_side}"
+        )
     print(
         f"Matched samples: {n_samples} | "
         f"train: {n_train} ({len(tr_loader)} batches) | "
@@ -1260,10 +1381,17 @@ def train(args):
         tl = 0.0
         train_ir_priority = 0.0
         train_ir_takeover = 0.0
-        for v, i, gt in tr_loader:
+        for batch in tr_loader:
+            if len(batch) == 4:
+                v, i, gt, valid_mask = batch
+            else:
+                v, i, gt = batch
+                valid_mask = None
             v = v.to(device, non_blocking=True)
             i = i.to(device, non_blocking=True)
             gt = gt.to(device, non_blocking=True)
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             f, ir_priority = _predict_with_multi_view(
@@ -1275,7 +1403,7 @@ def train(args):
                 autocast_dev=autocast_dev,
                 use_amp=use_amp,
             )
-            loss = loss_fn(v, i, gt, f, ir_priority=ir_priority)
+            loss = loss_fn(v, i, gt, f, ir_priority=ir_priority, valid_mask=valid_mask)
 
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -1292,10 +1420,17 @@ def train(args):
         val_ir_priority = 0.0
         val_ir_takeover = 0.0
         with torch.no_grad():
-            for v, i, gt in vl_loader:
+            for batch in vl_loader:
+                if len(batch) == 4:
+                    v, i, gt, valid_mask = batch
+                else:
+                    v, i, gt = batch
+                    valid_mask = None
                 v = v.to(device, non_blocking=True)
                 i = i.to(device, non_blocking=True)
                 gt = gt.to(device, non_blocking=True)
+                if valid_mask is not None:
+                    valid_mask = valid_mask.to(device, non_blocking=True)
                 pred, ir_priority = _predict_with_multi_view(
                     net=net,
                     detector=loss_fn.sp.detector,
@@ -1305,7 +1440,7 @@ def train(args):
                     autocast_dev=autocast_dev,
                     use_amp=use_amp,
                 )
-                vloss += loss_fn(v, i, gt, pred, ir_priority=ir_priority).item()
+                vloss += loss_fn(v, i, gt, pred, ir_priority=ir_priority, valid_mask=valid_mask).item()
                 val_ir_priority += ir_priority.mean().item()
                 val_ir_takeover += (ir_priority > 0.5).float().mean().item()
 
@@ -1633,6 +1768,31 @@ def parse_args():
     p.add_argument("--no-photo-aug", dest="photo_aug", action="store_false")
     p.set_defaults(photo_aug=True)
     p.add_argument(
+        "--native-res-train",
+        dest="native_res_train",
+        action="store_true",
+        help="Train on native image resolutions with batch padding.",
+    )
+    p.add_argument(
+        "--no-native-res-train",
+        dest="native_res_train",
+        action="store_false",
+        help="Disable native-resolution mode and force --size resize.",
+    )
+    p.set_defaults(native_res_train=False)
+    p.add_argument(
+        "--pad-multiple",
+        type=int,
+        default=8,
+        help="Pad native-resolution train batches to a spatial multiple (<=1 disables rounding).",
+    )
+    p.add_argument(
+        "--max-train-side",
+        type=int,
+        default=0,
+        help="Optional cap for native train samples: resize longest side to this value (0 disables cap).",
+    )
+    p.add_argument(
         "--train-views",
         type=int,
         default=2,
@@ -1909,6 +2069,12 @@ if __name__ == "__main__":
         raise ValueError("--luma-pred-mix must be in [0, 1]")
     if not (0.0 <= args.pred_rgb_mix <= 1.0):
         raise ValueError("--pred-rgb-mix must be in [0, 1]")
+    if args.pad_multiple < 0:
+        raise ValueError("--pad-multiple must be >= 0")
+    if args.max_train_side < 0:
+        raise ValueError("--max-train-side must be >= 0")
+    if args.native_res_train and args.pad_multiple == 0:
+        raise ValueError("--pad-multiple must be >= 1 when --native-res-train is enabled")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
