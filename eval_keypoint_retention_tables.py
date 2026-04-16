@@ -219,6 +219,16 @@ def parse_args():
         help="Optional dataset folder names under datasets-root (default: auto-discover valid dataset folders)",
     )
     p.add_argument(
+        "--model-dataset-names",
+        nargs="*",
+        default=[],
+        help=(
+            "Optional model-side dataset folder names under each model folder. "
+            "If provided, must align by position with discovered/selected datasets-root names "
+            "(example: --dataset-names LLVIP TNO ... --model-dataset-names dataset1 dataset2 ...)."
+        ),
+    )
+    p.add_argument(
         "--vis-dirname",
         type=str,
         default="vi",
@@ -278,14 +288,24 @@ def main():
             f"No valid datasets found under {datasets_root} with subfolders "
             f"{args.vis_dirname!r}/{args.ir_dirname!r}"
         )
+    if args.model_dataset_names and len(args.model_dataset_names) != len(dataset_specs):
+        raise ValueError(
+            "--model-dataset-names must have the same number of items as selected datasets "
+            f"({len(dataset_specs)}), got {len(args.model_dataset_names)}"
+        )
 
-    for dataset_name, vis_dir, ir_dir in dataset_specs:
+    for ds_idx, (dataset_name, vis_dir, ir_dir) in enumerate(dataset_specs, 1):
+        model_dataset_name = (
+            args.model_dataset_names[ds_idx - 1]
+            if args.model_dataset_names
+            else dataset_name
+        )
 
         rows: List[Dict[str, str]] = []
-        print(f"[dataset] {dataset_name}")
+        print(f"[dataset] {dataset_name} (model folder: {model_dataset_name})")
 
         for idx, model_dir in enumerate(model_dirs, 1):
-            fused_dir = model_dir / dataset_name
+            fused_dir = model_dir / model_dataset_name
             if args.fused_subdir:
                 fused_dir = fused_dir / args.fused_subdir
 
