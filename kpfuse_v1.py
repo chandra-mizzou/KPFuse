@@ -4,7 +4,7 @@ import random
 import time
 from functools import partial
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 from datetime import datetime
 
 import torch
@@ -59,6 +59,22 @@ def local_contrast_map(x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
     mean_sq = F.avg_pool2d(x * x, kernel_size=kernel_size, stride=1, padding=pad)
     var = (mean_sq - (mean * mean)).clamp_min(0.0)
     return torch.sqrt(var + 1e-6)
+
+
+def apply_tensor_photometric(
+    img: torch.Tensor,
+    brightness_jitter: float,
+    contrast_jitter: float,
+) -> torch.Tensor:
+    """Apply brightness/contrast jitter directly on tensor inputs."""
+    out = img
+    if brightness_jitter > 0:
+        b = random.uniform(max(0.0, 1.0 - brightness_jitter), 1.0 + brightness_jitter)
+        out = TF.adjust_brightness(out, b)
+    if contrast_jitter > 0:
+        c = random.uniform(max(0.0, 1.0 - contrast_jitter), 1.0 + contrast_jitter)
+        out = TF.adjust_contrast(out, c)
+    return out
 
 
 def dark_confidence_map(vis_y: torch.Tensor, dark_thresh: float, dark_gain: float) -> torch.Tensor:
@@ -685,6 +701,7 @@ class Loss(nn.Module):
         w_vis_luma: float = 1.25,
         w_ir_luma: float = 0.80,
         w_vis_contrast: float = 0.85,
+        w_union: float = 0.6,
     ):
         super().__init__()
         self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
@@ -1165,7 +1182,7 @@ def _predict_with_multi_view(
     use_amp: bool,
 ):
     """Average predictions across multiple photometric views for richer supervision."""
-    views = max(1, args.multi_view_augments)
+    views = max(1, args.train_views)
     preds = []
     ir_priors = []
     for view_idx in range(views):
@@ -1175,13 +1192,13 @@ def _predict_with_multi_view(
             # Apply lightweight tensor-domain photometric variation per extra view.
             vv = apply_tensor_photometric(
                 v,
-                brightness_jitter=args.multi_view_vis_brightness_jitter,
-                contrast_jitter=args.multi_view_vis_contrast_jitter,
+                brightness_jitter=args.vis_brightness_jitter,
+                contrast_jitter=args.vis_contrast_jitter,
             )
             ii = apply_tensor_photometric(
                 i,
-                brightness_jitter=args.multi_view_ir_brightness_jitter,
-                contrast_jitter=args.multi_view_ir_contrast_jitter,
+                brightness_jitter=args.ir_brightness_jitter,
+                contrast_jitter=args.ir_contrast_jitter,
             )
         with torch.amp.autocast(autocast_dev, enabled=use_amp):
             vis_kmap, ir_kmap = compute_keypoint_maps(vv, ii, detector)
@@ -1229,13 +1246,13 @@ def _train_forward_multi_view(
         else:
             vv = apply_tensor_photometric(
                 v,
-                brightness_jitter=args.multi_view_vis_brightness_jitter,
-                contrast_jitter=args.multi_view_vis_contrast_jitter,
+                brightness_jitter=args.vis_brightness_jitter,
+                contrast_jitter=args.vis_contrast_jitter,
             )
             ii = apply_tensor_photometric(
                 i,
-                brightness_jitter=args.multi_view_ir_brightness_jitter,
-                contrast_jitter=args.multi_view_ir_contrast_jitter,
+                brightness_jitter=args.ir_brightness_jitter,
+                contrast_jitter=args.ir_contrast_jitter,
             )
 
             if args.view_prefix_mix > 0:
@@ -1342,6 +1359,7 @@ def train(args):
         w_vis_luma=args.w_vis_luma,
         w_ir_luma=args.w_ir_luma,
         w_vis_contrast=args.w_vis_contrast,
+        w_union=args.w_sp_union,
     ).to(device)
     loss_fn.sp.eval()
     opt = torch.optim.AdamW(
