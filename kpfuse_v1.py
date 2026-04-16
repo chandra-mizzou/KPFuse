@@ -435,8 +435,24 @@ class FusionNet(nn.Module):
         if bottleneck_ch % attn_heads != 0:
             raise ValueError("bottleneck_ch must be divisible by attn_heads")
 
-        self.v1, self.v2, self.v3 = down(3, base_ch), down(base_ch, base_ch * 2), down(base_ch * 2, bottleneck_ch)
-        self.i1, self.i2, self.i3 = down(1, base_ch), down(base_ch, base_ch * 2), down(base_ch * 2, bottleneck_ch)
+        # 5-stage encoder (previously 3): progressively reduce resolution before fusion.
+        ch1 = base_ch
+        ch2 = base_ch * 2
+        ch3 = base_ch * 4
+        ch4 = base_ch * 8
+        ch5 = bottleneck_ch
+
+        self.v1 = down(3, ch1)
+        self.v2 = down(ch1, ch2)
+        self.v3 = down(ch2, ch3)
+        self.v4 = down(ch3, ch4)
+        self.v5 = down(ch4, ch5)
+
+        self.i1 = down(1, ch1)
+        self.i2 = down(ch1, ch2)
+        self.i3 = down(ch2, ch3)
+        self.i4 = down(ch3, ch4)
+        self.i5 = down(ch4, ch5)
 
         self.fusion_blocks = nn.ModuleList(
             [
@@ -450,12 +466,17 @@ class FusionNet(nn.Module):
             ]
         )
 
-        self.up3 = up(bottleneck_ch, base_ch * 2)
-        self.c3 = conv((base_ch * 2) + (base_ch * 2) + (base_ch * 2), base_ch * 2)
-        self.up2 = up(base_ch * 2, base_ch)
-        self.c2 = conv(base_ch + base_ch + base_ch, base_ch)
-        self.up1 = up(base_ch, base_ch)
-        self.out = nn.Conv2d(base_ch, 3, 3, 1, 1)
+        # 5-stage decoder (previously 3), symmetric with encoder.
+        self.up5 = up(ch5, ch4)
+        self.c5 = conv(ch4 + ch4 + ch4, ch4)
+        self.up4 = up(ch4, ch3)
+        self.c4 = conv(ch3 + ch3 + ch3, ch3)
+        self.up3 = up(ch3, ch2)
+        self.c3 = conv(ch2 + ch2 + ch2, ch2)
+        self.up2 = up(ch2, ch1)
+        self.c2 = conv(ch1 + ch1 + ch1, ch1)
+        self.up1 = up(ch1, ch1)
+        self.out = nn.Conv2d(ch1, 3, 3, 1, 1)
         self.gate_alpha_vis = gate_alpha_vis
         self.gate_alpha_ir = gate_alpha_ir
         self.attn_bias_gamma = attn_bias_gamma
@@ -540,32 +561,36 @@ class FusionNet(nn.Module):
         v1 = self.v1(v)
         v2 = self.v2(v1)
         v3 = self.v3(v2)
+        v4 = self.v4(v3)
+        v5 = self.v5(v4)
 
         i1 = self.i1(i)
         i2 = self.i2(i1)
         i3 = self.i3(i2)
+        i4 = self.i4(i3)
+        i5 = self.i5(i4)
 
         if vis_kmap is not None:
-            vis_bias = F.interpolate(vis_kmap, size=v3.shape[-2:], mode="bilinear", align_corners=False)
+            vis_bias = F.interpolate(vis_kmap, size=v5.shape[-2:], mode="bilinear", align_corners=False)
             if self.attn_bias_detach:
                 vis_bias = vis_bias.detach()
             # Feature gating: boost keypoint-relevant VIS regions.
-            v3 = v3 * (1.0 + self.gate_alpha_vis * vis_bias)
+            v5 = v5 * (1.0 + self.gate_alpha_vis * vis_bias)
         else:
             vis_bias = None
 
         if ir_kmap is not None:
-            ir_bias = F.interpolate(ir_kmap, size=i3.shape[-2:], mode="bilinear", align_corners=False)
+            ir_bias = F.interpolate(ir_kmap, size=i5.shape[-2:], mode="bilinear", align_corners=False)
             if self.attn_bias_detach:
                 ir_bias = ir_bias.detach()
             # Feature gating: boost keypoint-relevant IR regions.
-            i3 = i3 * (1.0 + self.gate_alpha_ir * ir_bias)
+            i5 = i5 * (1.0 + self.gate_alpha_ir * ir_bias)
         else:
             ir_bias = None
 
-        bsz, c, h, w = v3.shape
-        vf = v3.flatten(2).transpose(1, 2)
-        if_ = i3.flatten(2).transpose(1, 2)
+        bsz, c, h, w = v5.shape
+        vf = v5.flatten(2).transpose(1, 2)
+        if_ = i5.flatten(2).transpose(1, 2)
 
         f = vf
         for block in self.fusion_blocks:
@@ -581,9 +606,29 @@ class FusionNet(nn.Module):
             )
         f = f.transpose(1, 2).reshape(bsz, c, h, w)
 
-        d3 = self.c3(torch.cat([self.up3(f), v2, i2], dim=1))
-        d2 = self.c2(torch.cat([self.up2(d3), v1, i1], dim=1))
+        u5 = self.up5(f)
+        if u5.shape[-2:] != v4.shape[-2:]:
+            u5 = F.interpolate(u5, size=v4.shape[-2:], mode="bilinear", align_corners=False)
+        d5 = self.c5(torch.cat([u5, v4, i4], dim=1))
+
+        u4 = self.up4(d5)
+        if u4.shape[-2:] != v3.shape[-2:]:
+            u4 = F.interpolate(u4, size=v3.shape[-2:], mode="bilinear", align_corners=False)
+        d4 = self.c4(torch.cat([u4, v3, i3], dim=1))
+
+        u3 = self.up3(d4)
+        if u3.shape[-2:] != v2.shape[-2:]:
+            u3 = F.interpolate(u3, size=v2.shape[-2:], mode="bilinear", align_corners=False)
+        d3 = self.c3(torch.cat([u3, v2, i2], dim=1))
+
+        u2 = self.up2(d3)
+        if u2.shape[-2:] != v1.shape[-2:]:
+            u2 = F.interpolate(u2, size=v1.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.c2(torch.cat([u2, v1, i1], dim=1))
+
         d1 = self.up1(d2)
+        if d1.shape[-2:] != v.shape[-2:]:
+            d1 = F.interpolate(d1, size=v.shape[-2:], mode="bilinear", align_corners=False)
         pred_rgb = torch.sigmoid(self.out(d1))
         ir_priority = self._compute_ir_priority(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
         fused = self._adaptive_blend(v, i, pred_rgb, ir_priority)
