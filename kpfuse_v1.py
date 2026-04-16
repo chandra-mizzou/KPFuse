@@ -405,6 +405,10 @@ class FusionNet(nn.Module):
         attn_heads: int = 16,
         attn_sr: int = 4,
         attn_depth: int = 3,
+        attn_sr_l3: int = 1,
+        attn_sr_l4: int = 2,
+        attn_depth_l3: int = 1,
+        attn_depth_l4: int = 1,
         attn_mlp_ratio: float = 2.0,
         gate_alpha_vis: float = 0.25,
         gate_alpha_ir: float = 0.35,
@@ -432,15 +436,18 @@ class FusionNet(nn.Module):
         pred_rgb_mix: float = 0.05,
     ):
         super().__init__()
-        if bottleneck_ch % attn_heads != 0:
-            raise ValueError("bottleneck_ch must be divisible by attn_heads")
-
         # 5-stage encoder (previously 3): progressively reduce resolution before fusion.
         ch1 = base_ch
         ch2 = base_ch * 2
         ch3 = base_ch * 4
         ch4 = base_ch * 8
         ch5 = bottleneck_ch
+        if (attn_depth_l3 > 0) and (ch3 % attn_heads != 0):
+            raise ValueError("Layer-3 channels must be divisible by attn_heads when attn_depth_l3>0")
+        if (attn_depth_l4 > 0) and (ch4 % attn_heads != 0):
+            raise ValueError("Layer-4 channels must be divisible by attn_heads when attn_depth_l4>0")
+        if (attn_depth > 0) and (ch5 % attn_heads != 0):
+            raise ValueError("bottleneck_ch must be divisible by attn_heads when attn_depth>0")
 
         self.v1 = down(3, ch1)
         self.v2 = down(ch1, ch2)
@@ -454,10 +461,33 @@ class FusionNet(nn.Module):
         self.i4 = down(ch3, ch4)
         self.i5 = down(ch4, ch5)
 
+        # Multi-scale token fusion: add fusion at layer-3/layer-4 before deepest bottleneck.
+        self.fusion_blocks_l3 = nn.ModuleList(
+            [
+                FusionTokenBlock(
+                    dim=ch3,
+                    heads=attn_heads,
+                    sr=attn_sr_l3,
+                    mlp_ratio=attn_mlp_ratio,
+                )
+                for _ in range(attn_depth_l3)
+            ]
+        )
+        self.fusion_blocks_l4 = nn.ModuleList(
+            [
+                FusionTokenBlock(
+                    dim=ch4,
+                    heads=attn_heads,
+                    sr=attn_sr_l4,
+                    mlp_ratio=attn_mlp_ratio,
+                )
+                for _ in range(attn_depth_l4)
+            ]
+        )
         self.fusion_blocks = nn.ModuleList(
             [
                 FusionTokenBlock(
-                    dim=bottleneck_ch,
+                    dim=ch5,
                     heads=attn_heads,
                     sr=attn_sr,
                     mlp_ratio=attn_mlp_ratio,
@@ -501,6 +531,56 @@ class FusionNet(nn.Module):
         self.ir_priority_max = ir_priority_max
         self.luma_pred_mix = luma_pred_mix
         self.pred_rgb_mix = pred_rgb_mix
+
+    def _run_fusion_stage(
+        self,
+        vis_feat: torch.Tensor,
+        ir_feat: torch.Tensor,
+        blocks: nn.ModuleList,
+        vis_kmap: Optional[torch.Tensor],
+        ir_kmap: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if len(blocks) == 0:
+            return vis_feat
+
+        vis_bias = None
+        if vis_kmap is not None:
+            vis_bias = F.interpolate(
+                vis_kmap,
+                size=vis_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if self.attn_bias_detach:
+                vis_bias = vis_bias.detach()
+            vis_feat = vis_feat * (1.0 + self.gate_alpha_vis * vis_bias)
+
+        ir_bias = None
+        if ir_kmap is not None:
+            ir_bias = F.interpolate(
+                ir_kmap,
+                size=ir_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if self.attn_bias_detach:
+                ir_bias = ir_bias.detach()
+            ir_feat = ir_feat * (1.0 + self.gate_alpha_ir * ir_bias)
+
+        bsz, c, h, w = vis_feat.shape
+        vis_tokens = vis_feat.flatten(2).transpose(1, 2)
+        ir_tokens = ir_feat.flatten(2).transpose(1, 2)
+        for block in blocks:
+            vis_tokens = block(
+                vis_tokens,
+                ir_tokens,
+                h,
+                w,
+                vis_bias=vis_bias,
+                ir_bias=ir_bias,
+                attn_bias_gamma=self.attn_bias_gamma,
+            )
+        return vis_tokens.transpose(1, 2).reshape(bsz, c, h, w)
 
     def _compute_ir_priority(self, v, i, vis_kmap=None, ir_kmap=None):
         vis_y = rgb_to_luma(v)
@@ -561,60 +641,32 @@ class FusionNet(nn.Module):
         v1 = self.v1(v)
         v2 = self.v2(v1)
         v3 = self.v3(v2)
-        v4 = self.v4(v3)
-        v5 = self.v5(v4)
 
         i1 = self.i1(i)
         i2 = self.i2(i1)
         i3 = self.i3(i2)
+        # Mid-level fusion at layer-3 for richer texture transfer.
+        v3_f = self._run_fusion_stage(v3, i3, self.fusion_blocks_l3, vis_kmap, ir_kmap)
+
+        v4 = self.v4(v3_f)
         i4 = self.i4(i3)
+        # Mid/deep fusion at layer-4 for detail-aware semantic alignment.
+        v4_f = self._run_fusion_stage(v4, i4, self.fusion_blocks_l4, vis_kmap, ir_kmap)
+
+        v5 = self.v5(v4_f)
         i5 = self.i5(i4)
-
-        if vis_kmap is not None:
-            vis_bias = F.interpolate(vis_kmap, size=v5.shape[-2:], mode="bilinear", align_corners=False)
-            if self.attn_bias_detach:
-                vis_bias = vis_bias.detach()
-            # Feature gating: boost keypoint-relevant VIS regions.
-            v5 = v5 * (1.0 + self.gate_alpha_vis * vis_bias)
-        else:
-            vis_bias = None
-
-        if ir_kmap is not None:
-            ir_bias = F.interpolate(ir_kmap, size=i5.shape[-2:], mode="bilinear", align_corners=False)
-            if self.attn_bias_detach:
-                ir_bias = ir_bias.detach()
-            # Feature gating: boost keypoint-relevant IR regions.
-            i5 = i5 * (1.0 + self.gate_alpha_ir * ir_bias)
-        else:
-            ir_bias = None
-
-        bsz, c, h, w = v5.shape
-        vf = v5.flatten(2).transpose(1, 2)
-        if_ = i5.flatten(2).transpose(1, 2)
-
-        f = vf
-        for block in self.fusion_blocks:
-            # Attention logit bias uses KeyNet maps as additive logits prior.
-            f = block(
-                f,
-                if_,
-                h,
-                w,
-                vis_bias=vis_bias,
-                ir_bias=ir_bias,
-                attn_bias_gamma=self.attn_bias_gamma,
-            )
-        f = f.transpose(1, 2).reshape(bsz, c, h, w)
+        # Final bottleneck fusion.
+        f = self._run_fusion_stage(v5, i5, self.fusion_blocks, vis_kmap, ir_kmap)
 
         u5 = self.up5(f)
-        if u5.shape[-2:] != v4.shape[-2:]:
-            u5 = F.interpolate(u5, size=v4.shape[-2:], mode="bilinear", align_corners=False)
-        d5 = self.c5(torch.cat([u5, v4, i4], dim=1))
+        if u5.shape[-2:] != v4_f.shape[-2:]:
+            u5 = F.interpolate(u5, size=v4_f.shape[-2:], mode="bilinear", align_corners=False)
+        d5 = self.c5(torch.cat([u5, v4_f, i4], dim=1))
 
         u4 = self.up4(d5)
-        if u4.shape[-2:] != v3.shape[-2:]:
-            u4 = F.interpolate(u4, size=v3.shape[-2:], mode="bilinear", align_corners=False)
-        d4 = self.c4(torch.cat([u4, v3, i3], dim=1))
+        if u4.shape[-2:] != v3_f.shape[-2:]:
+            u4 = F.interpolate(u4, size=v3_f.shape[-2:], mode="bilinear", align_corners=False)
+        d4 = self.c4(torch.cat([u4, v3_f, i3], dim=1))
 
         u3 = self.up3(d4)
         if u3.shape[-2:] != v2.shape[-2:]:
@@ -1371,6 +1423,10 @@ def train(args):
         attn_heads=args.attn_heads,
         attn_sr=args.attn_sr,
         attn_depth=args.attn_depth,
+        attn_sr_l3=args.attn_sr_l3,
+        attn_sr_l4=args.attn_sr_l4,
+        attn_depth_l3=args.attn_depth_l3,
+        attn_depth_l4=args.attn_depth_l4,
         attn_mlp_ratio=args.attn_mlp_ratio,
         gate_alpha_vis=args.gate_alpha_vis,
         gate_alpha_ir=args.gate_alpha_ir,
@@ -1977,6 +2033,30 @@ def parse_args():
     p.add_argument("--attn-heads", type=int, default=16)
     p.add_argument("--attn-sr", type=int, default=4)
     p.add_argument("--attn-depth", type=int, default=3)
+    p.add_argument(
+        "--attn-sr-l3",
+        type=int,
+        default=1,
+        help="Spatial-reduction ratio for Layer-3 multi-scale fusion attention.",
+    )
+    p.add_argument(
+        "--attn-sr-l4",
+        type=int,
+        default=2,
+        help="Spatial-reduction ratio for Layer-4 multi-scale fusion attention.",
+    )
+    p.add_argument(
+        "--attn-depth-l3",
+        type=int,
+        default=1,
+        help="Number of FusionTokenBlocks applied at Layer-3 features.",
+    )
+    p.add_argument(
+        "--attn-depth-l4",
+        type=int,
+        default=1,
+        help="Number of FusionTokenBlocks applied at Layer-4 features.",
+    )
     p.add_argument("--attn-mlp-ratio", type=float, default=2.0)
     p.add_argument(
         "--gate-alpha-vis",
@@ -2132,6 +2212,18 @@ if __name__ == "__main__":
         raise ValueError("--luma-pred-mix must be in [0, 1]")
     if not (0.0 <= args.pred_rgb_mix <= 1.0):
         raise ValueError("--pred-rgb-mix must be in [0, 1]")
+    if args.attn_depth < 0:
+        raise ValueError("--attn-depth must be >= 0")
+    if args.attn_depth_l3 < 0:
+        raise ValueError("--attn-depth-l3 must be >= 0")
+    if args.attn_depth_l4 < 0:
+        raise ValueError("--attn-depth-l4 must be >= 0")
+    if args.attn_sr < 1:
+        raise ValueError("--attn-sr must be >= 1")
+    if args.attn_sr_l3 < 1:
+        raise ValueError("--attn-sr-l3 must be >= 1")
+    if args.attn_sr_l4 < 1:
+        raise ValueError("--attn-sr-l4 must be >= 1")
     if args.pad_multiple < 0:
         raise ValueError("--pad-multiple must be >= 0")
     if args.max_train_side < 0:
