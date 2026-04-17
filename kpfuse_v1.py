@@ -2,8 +2,9 @@ import argparse
 import os
 import random
 import time
+from functools import partial
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 from datetime import datetime
 
 import torch
@@ -60,6 +61,22 @@ def local_contrast_map(x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
     return torch.sqrt(var + 1e-6)
 
 
+def apply_tensor_photometric(
+    img: torch.Tensor,
+    brightness_jitter: float,
+    contrast_jitter: float,
+) -> torch.Tensor:
+    """Apply brightness/contrast jitter directly on tensor inputs."""
+    out = img
+    if brightness_jitter > 0:
+        b = random.uniform(max(0.0, 1.0 - brightness_jitter), 1.0 + brightness_jitter)
+        out = TF.adjust_brightness(out, b)
+    if contrast_jitter > 0:
+        c = random.uniform(max(0.0, 1.0 - contrast_jitter), 1.0 + contrast_jitter)
+        out = TF.adjust_contrast(out, c)
+    return out
+
+
 def dark_confidence_map(vis_y: torch.Tensor, dark_thresh: float, dark_gain: float) -> torch.Tensor:
     return torch.sigmoid((dark_thresh - vis_y) * dark_gain)
 
@@ -98,6 +115,8 @@ class FusionDataset(Dataset):
         samples,
         size: int = 256,
         augment: bool = False,
+        native_res: bool = False,
+        max_side: int = 0,
         photometric_aug: bool = True,
         vis_brightness_jitter: float = 0.20,
         vis_contrast_jitter: float = 0.20,
@@ -105,6 +124,7 @@ class FusionDataset(Dataset):
         ir_contrast_jitter: float = 0.20,
         gt_brightness_jitter: float = 0.10,
         gt_contrast_jitter: float = 0.10,
+        photometric_views: int = 1,
         indices: Optional[Sequence[int]] = None,
     ):
         if indices is None:
@@ -116,6 +136,8 @@ class FusionDataset(Dataset):
             raise RuntimeError("Dataset split has no samples.")
 
         self.augment = augment
+        self.native_res = native_res
+        self.max_side = max_side
         self.photometric_aug = photometric_aug
         self.vis_brightness_jitter = vis_brightness_jitter
         self.vis_contrast_jitter = vis_contrast_jitter
@@ -123,6 +145,7 @@ class FusionDataset(Dataset):
         self.ir_contrast_jitter = ir_contrast_jitter
         self.gt_brightness_jitter = gt_brightness_jitter
         self.gt_contrast_jitter = gt_contrast_jitter
+        self.photometric_views = max(1, int(photometric_views))
         self.resize = T.Resize((size, size))
         self.to_tensor = T.ToTensor()
 
@@ -144,12 +167,36 @@ class FusionDataset(Dataset):
             img = TF.adjust_contrast(img, self._sample_factor(c_jitter))
         return img
 
+    def _maybe_resize_native(
+        self, v_img: Image.Image, i_img: Image.Image, g_img: Image.Image
+    ) -> tuple[Image.Image, Image.Image, Image.Image]:
+        if self.max_side <= 0:
+            return v_img, i_img, g_img
+        w, h = v_img.size
+        cur_side = max(h, w)
+        if cur_side <= self.max_side:
+            return v_img, i_img, g_img
+        scale = self.max_side / float(cur_side)
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        out_size = [new_h, new_w]
+        v_img = TF.resize(v_img, out_size)
+        i_img = TF.resize(i_img, out_size)
+        g_img = TF.resize(g_img, out_size)
+        return v_img, i_img, g_img
+
     def __getitem__(self, i):
         vp, ip, gp = self.samples[i]
         with Image.open(vp) as v_img, Image.open(ip) as i_img, Image.open(gp) as g_img:
-            v_img = self.resize(v_img.convert("RGB"))
-            i_img = self.resize(i_img.convert("L"))
-            g_img = self.resize(g_img.convert("RGB"))
+            v_img = v_img.convert("RGB")
+            i_img = i_img.convert("L")
+            g_img = g_img.convert("RGB")
+            if self.native_res:
+                v_img, i_img, g_img = self._maybe_resize_native(v_img, i_img, g_img)
+            else:
+                v_img = self.resize(v_img)
+                i_img = self.resize(i_img)
+                g_img = self.resize(g_img)
 
             # Apply the exact same geometric augmentation to all modalities.
             if self.augment:
@@ -162,23 +209,69 @@ class FusionDataset(Dataset):
                     i_img = TF.vflip(i_img)
                     g_img = TF.vflip(g_img)
 
-                # Train-only photometric jitter to improve robustness to
-                # exposure/contrast variability across sensors.
-                if self.photometric_aug:
-                    v_img = self._apply_photometric(
-                        v_img, self.vis_brightness_jitter, self.vis_contrast_jitter
-                    )
-                    i_img = self._apply_photometric(
-                        i_img, self.ir_brightness_jitter, self.ir_contrast_jitter
-                    )
-                    g_img = self._apply_photometric(
-                        g_img, self.gt_brightness_jitter, self.gt_contrast_jitter
-                    )
+            # Train-only photometric jitter to improve robustness to
+            # exposure/contrast variability across sensors.
+            if self.augment and self.photometric_aug:
+                if self.photometric_views > 1:
+                    for _ in range(self.photometric_views - 1):
+                        v_img = self._apply_photometric(
+                            v_img, self.vis_brightness_jitter, self.vis_contrast_jitter
+                        )
+                        i_img = self._apply_photometric(
+                            i_img, self.ir_brightness_jitter, self.ir_contrast_jitter
+                        )
+                        g_img = self._apply_photometric(
+                            g_img, self.gt_brightness_jitter, self.gt_contrast_jitter
+                        )
+                v_img = self._apply_photometric(
+                    v_img, self.vis_brightness_jitter, self.vis_contrast_jitter
+                )
+                i_img = self._apply_photometric(
+                    i_img, self.ir_brightness_jitter, self.ir_contrast_jitter
+                )
+                g_img = self._apply_photometric(
+                    g_img, self.gt_brightness_jitter, self.gt_contrast_jitter
+                )
 
             v = self.to_tensor(v_img)
             ir = self.to_tensor(i_img)
             gt = self.to_tensor(g_img)
         return v, ir, gt
+
+
+def _pad_image_and_mask(
+    img: torch.Tensor, target_h: int, target_w: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, h, w = img.shape
+    pad_h = target_h - h
+    pad_w = target_w - w
+    if pad_h < 0 or pad_w < 0:
+        raise ValueError("Target padding size must be >= current tensor size.")
+    pad = (0, pad_w, 0, pad_h)
+    img = F.pad(img, pad, mode="constant", value=0.0)
+    mask = torch.ones((1, h, w), dtype=img.dtype)
+    mask = F.pad(mask, pad, mode="constant", value=0.0)
+    return img, mask
+
+
+def native_pad_collate(batch, pad_multiple: int = 8):
+    vs, is_, gts = zip(*batch)
+    max_h = max(v.shape[1] for v in vs)
+    max_w = max(v.shape[2] for v in vs)
+    if pad_multiple > 1:
+        max_h = ((max_h + pad_multiple - 1) // pad_multiple) * pad_multiple
+        max_w = ((max_w + pad_multiple - 1) // pad_multiple) * pad_multiple
+
+    v_out, i_out, gt_out, m_out = [], [], [], []
+    for v, i, gt in zip(vs, is_, gts):
+        v_pad, mask = _pad_image_and_mask(v, max_h, max_w)
+        i_pad, _ = _pad_image_and_mask(i, max_h, max_w)
+        gt_pad, _ = _pad_image_and_mask(gt, max_h, max_w)
+        v_out.append(v_pad)
+        i_out.append(i_pad)
+        gt_out.append(gt_pad)
+        m_out.append(mask)
+    return torch.stack(v_out, dim=0), torch.stack(i_out, dim=0), torch.stack(gt_out, dim=0), torch.stack(m_out, dim=0)
 
 
 def match_pairs(vis_dir: str, ir_dir: str):
@@ -312,6 +405,10 @@ class FusionNet(nn.Module):
         attn_heads: int = 16,
         attn_sr: int = 4,
         attn_depth: int = 3,
+        attn_sr_l3: int = 1,
+        attn_sr_l4: int = 2,
+        attn_depth_l3: int = 1,
+        attn_depth_l4: int = 1,
         attn_mlp_ratio: float = 2.0,
         gate_alpha_vis: float = 0.25,
         gate_alpha_ir: float = 0.35,
@@ -325,7 +422,9 @@ class FusionNet(nn.Module):
         sat_thresh: float = 0.98,
         sat_gain: float = 24.0,
         sat_ir_min: float = 0.50,
+        ir_priority_bias_offset: float = 0.00,
         quality_temp: float = 0.15,
+        ir_priority_bias_init: float = 0.0,
         vis_quality_luma_w: float = 0.55,
         vis_quality_grad_w: float = 0.25,
         vis_quality_kp_w: float = 0.20,
@@ -337,16 +436,58 @@ class FusionNet(nn.Module):
         pred_rgb_mix: float = 0.05,
     ):
         super().__init__()
-        if bottleneck_ch % attn_heads != 0:
-            raise ValueError("bottleneck_ch must be divisible by attn_heads")
+        # 5-stage encoder (previously 3): progressively reduce resolution before fusion.
+        ch1 = base_ch
+        ch2 = base_ch * 2
+        ch3 = base_ch * 4
+        ch4 = base_ch * 8
+        ch5 = bottleneck_ch
+        if (attn_depth_l3 > 0) and (ch3 % attn_heads != 0):
+            raise ValueError("Layer-3 channels must be divisible by attn_heads when attn_depth_l3>0")
+        if (attn_depth_l4 > 0) and (ch4 % attn_heads != 0):
+            raise ValueError("Layer-4 channels must be divisible by attn_heads when attn_depth_l4>0")
+        if (attn_depth > 0) and (ch5 % attn_heads != 0):
+            raise ValueError("bottleneck_ch must be divisible by attn_heads when attn_depth>0")
 
-        self.v1, self.v2, self.v3 = down(3, base_ch), down(base_ch, base_ch * 2), down(base_ch * 2, bottleneck_ch)
-        self.i1, self.i2, self.i3 = down(1, base_ch), down(base_ch, base_ch * 2), down(base_ch * 2, bottleneck_ch)
+        self.v1 = down(3, ch1)
+        self.v2 = down(ch1, ch2)
+        self.v3 = down(ch2, ch3)
+        self.v4 = down(ch3, ch4)
+        self.v5 = down(ch4, ch5)
 
+        self.i1 = down(1, ch1)
+        self.i2 = down(ch1, ch2)
+        self.i3 = down(ch2, ch3)
+        self.i4 = down(ch3, ch4)
+        self.i5 = down(ch4, ch5)
+
+        # Multi-scale token fusion: add fusion at layer-3/layer-4 before deepest bottleneck.
+        self.fusion_blocks_l3 = nn.ModuleList(
+            [
+                FusionTokenBlock(
+                    dim=ch3,
+                    heads=attn_heads,
+                    sr=attn_sr_l3,
+                    mlp_ratio=attn_mlp_ratio,
+                )
+                for _ in range(attn_depth_l3)
+            ]
+        )
+        self.fusion_blocks_l4 = nn.ModuleList(
+            [
+                FusionTokenBlock(
+                    dim=ch4,
+                    heads=attn_heads,
+                    sr=attn_sr_l4,
+                    mlp_ratio=attn_mlp_ratio,
+                )
+                for _ in range(attn_depth_l4)
+            ]
+        )
         self.fusion_blocks = nn.ModuleList(
             [
                 FusionTokenBlock(
-                    dim=bottleneck_ch,
+                    dim=ch5,
                     heads=attn_heads,
                     sr=attn_sr,
                     mlp_ratio=attn_mlp_ratio,
@@ -355,12 +496,17 @@ class FusionNet(nn.Module):
             ]
         )
 
-        self.up3 = up(bottleneck_ch, base_ch * 2)
-        self.c3 = conv((base_ch * 2) + (base_ch * 2) + (base_ch * 2), base_ch * 2)
-        self.up2 = up(base_ch * 2, base_ch)
-        self.c2 = conv(base_ch + base_ch + base_ch, base_ch)
-        self.up1 = up(base_ch, base_ch)
-        self.out = nn.Conv2d(base_ch, 3, 3, 1, 1)
+        # 5-stage decoder (previously 3), symmetric with encoder.
+        self.up5 = up(ch5, ch4)
+        self.c5 = conv(ch4 + ch4 + ch4, ch4)
+        self.up4 = up(ch4, ch3)
+        self.c4 = conv(ch3 + ch3 + ch3, ch3)
+        self.up3 = up(ch3, ch2)
+        self.c3 = conv(ch2 + ch2 + ch2, ch2)
+        self.up2 = up(ch2, ch1)
+        self.c2 = conv(ch1 + ch1 + ch1, ch1)
+        self.up1 = up(ch1, ch1)
+        self.out = nn.Conv2d(ch1, 3, 3, 1, 1)
         self.gate_alpha_vis = gate_alpha_vis
         self.gate_alpha_ir = gate_alpha_ir
         self.attn_bias_gamma = attn_bias_gamma
@@ -373,7 +519,9 @@ class FusionNet(nn.Module):
         self.sat_thresh = sat_thresh
         self.sat_gain = sat_gain
         self.sat_ir_min = sat_ir_min
+        self.ir_priority_bias_offset = ir_priority_bias_offset
         self.quality_temp = quality_temp
+        self.ir_priority_bias = float(ir_priority_bias_init)
         self.vis_quality_luma_w = vis_quality_luma_w
         self.vis_quality_grad_w = vis_quality_grad_w
         self.vis_quality_kp_w = vis_quality_kp_w
@@ -383,6 +531,56 @@ class FusionNet(nn.Module):
         self.ir_priority_max = ir_priority_max
         self.luma_pred_mix = luma_pred_mix
         self.pred_rgb_mix = pred_rgb_mix
+
+    def _run_fusion_stage(
+        self,
+        vis_feat: torch.Tensor,
+        ir_feat: torch.Tensor,
+        blocks: nn.ModuleList,
+        vis_kmap: Optional[torch.Tensor],
+        ir_kmap: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if len(blocks) == 0:
+            return vis_feat
+
+        vis_bias = None
+        if vis_kmap is not None:
+            vis_bias = F.interpolate(
+                vis_kmap,
+                size=vis_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if self.attn_bias_detach:
+                vis_bias = vis_bias.detach()
+            vis_feat = vis_feat * (1.0 + self.gate_alpha_vis * vis_bias)
+
+        ir_bias = None
+        if ir_kmap is not None:
+            ir_bias = F.interpolate(
+                ir_kmap,
+                size=ir_feat.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if self.attn_bias_detach:
+                ir_bias = ir_bias.detach()
+            ir_feat = ir_feat * (1.0 + self.gate_alpha_ir * ir_bias)
+
+        bsz, c, h, w = vis_feat.shape
+        vis_tokens = vis_feat.flatten(2).transpose(1, 2)
+        ir_tokens = ir_feat.flatten(2).transpose(1, 2)
+        for block in blocks:
+            vis_tokens = block(
+                vis_tokens,
+                ir_tokens,
+                h,
+                w,
+                vis_bias=vis_bias,
+                ir_bias=ir_bias,
+                attn_bias_gamma=self.attn_bias_gamma,
+            )
+        return vis_tokens.transpose(1, 2).reshape(bsz, c, h, w)
 
     def _compute_ir_priority(self, v, i, vis_kmap=None, ir_kmap=None):
         vis_y = rgb_to_luma(v)
@@ -412,7 +610,8 @@ class FusionNet(nn.Module):
         low_vis_conf = torch.sigmoid((self.vis_conf_thresh - vis_quality) * self.vis_conf_gain)
         need_ir = torch.maximum(dark_conf, low_vis_conf)
         quality_delta = (ir_quality - vis_quality - self.ir_adv_margin) / max(self.quality_temp, 1e-4)
-        ir_adv = torch.sigmoid(quality_delta)
+        quality_delta = quality_delta + self.ir_priority_bias
+        ir_adv = torch.sigmoid(quality_delta + self.ir_priority_bias_offset)
         ir_priority = need_ir * ir_adv
 
         # Special case: RGB saturation (near-white clipped pixels).
@@ -446,46 +645,42 @@ class FusionNet(nn.Module):
         i1 = self.i1(i)
         i2 = self.i2(i1)
         i3 = self.i3(i2)
+        # Mid-level fusion at layer-3 for richer texture transfer.
+        v3_f = self._run_fusion_stage(v3, i3, self.fusion_blocks_l3, vis_kmap, ir_kmap)
 
-        if vis_kmap is not None:
-            vis_bias = F.interpolate(vis_kmap, size=v3.shape[-2:], mode="bilinear", align_corners=False)
-            if self.attn_bias_detach:
-                vis_bias = vis_bias.detach()
-            # Feature gating: boost keypoint-relevant VIS regions.
-            v3 = v3 * (1.0 + self.gate_alpha_vis * vis_bias)
-        else:
-            vis_bias = None
+        v4 = self.v4(v3_f)
+        i4 = self.i4(i3)
+        # Mid/deep fusion at layer-4 for detail-aware semantic alignment.
+        v4_f = self._run_fusion_stage(v4, i4, self.fusion_blocks_l4, vis_kmap, ir_kmap)
 
-        if ir_kmap is not None:
-            ir_bias = F.interpolate(ir_kmap, size=i3.shape[-2:], mode="bilinear", align_corners=False)
-            if self.attn_bias_detach:
-                ir_bias = ir_bias.detach()
-            # Feature gating: boost keypoint-relevant IR regions.
-            i3 = i3 * (1.0 + self.gate_alpha_ir * ir_bias)
-        else:
-            ir_bias = None
+        v5 = self.v5(v4_f)
+        i5 = self.i5(i4)
+        # Final bottleneck fusion.
+        f = self._run_fusion_stage(v5, i5, self.fusion_blocks, vis_kmap, ir_kmap)
 
-        bsz, c, h, w = v3.shape
-        vf = v3.flatten(2).transpose(1, 2)
-        if_ = i3.flatten(2).transpose(1, 2)
+        u5 = self.up5(f)
+        if u5.shape[-2:] != v4_f.shape[-2:]:
+            u5 = F.interpolate(u5, size=v4_f.shape[-2:], mode="bilinear", align_corners=False)
+        d5 = self.c5(torch.cat([u5, v4_f, i4], dim=1))
 
-        f = vf
-        for block in self.fusion_blocks:
-            # Attention logit bias uses KeyNet maps as additive logits prior.
-            f = block(
-                f,
-                if_,
-                h,
-                w,
-                vis_bias=vis_bias,
-                ir_bias=ir_bias,
-                attn_bias_gamma=self.attn_bias_gamma,
-            )
-        f = f.transpose(1, 2).reshape(bsz, c, h, w)
+        u4 = self.up4(d5)
+        if u4.shape[-2:] != v3_f.shape[-2:]:
+            u4 = F.interpolate(u4, size=v3_f.shape[-2:], mode="bilinear", align_corners=False)
+        d4 = self.c4(torch.cat([u4, v3_f, i3], dim=1))
 
-        d3 = self.c3(torch.cat([self.up3(f), v2, i2], dim=1))
-        d2 = self.c2(torch.cat([self.up2(d3), v1, i1], dim=1))
+        u3 = self.up3(d4)
+        if u3.shape[-2:] != v2.shape[-2:]:
+            u3 = F.interpolate(u3, size=v2.shape[-2:], mode="bilinear", align_corners=False)
+        d3 = self.c3(torch.cat([u3, v2, i2], dim=1))
+
+        u2 = self.up2(d3)
+        if u2.shape[-2:] != v1.shape[-2:]:
+            u2 = F.interpolate(u2, size=v1.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.c2(torch.cat([u2, v1, i1], dim=1))
+
         d1 = self.up1(d2)
+        if d1.shape[-2:] != v.shape[-2:]:
+            d1 = F.interpolate(d1, size=v.shape[-2:], mode="bilinear", align_corners=False)
         pred_rgb = torch.sigmoid(self.out(d1))
         ir_priority = self._compute_ir_priority(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
         fused = self._adaptive_blend(v, i, pred_rgb, ir_priority)
@@ -537,7 +732,18 @@ class KeyNetLoss(nn.Module):
         x_max = x.amax(dim=(-2, -1), keepdim=True)
         return (x - x_min) / (x_max - x_min + 1e-6)
 
-    def forward(self, v, i, f):
+    @staticmethod
+    def _masked_l1(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        diff = (a - b).abs()
+        if mask is None:
+            return diff.mean()
+        if mask.shape[-2:] != diff.shape[-2:]:
+            mask = F.interpolate(mask, size=diff.shape[-2:], mode="nearest")
+        mask = mask.to(dtype=diff.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (diff * mask).sum() / denom
+
+    def forward(self, v, i, f, valid_mask: Optional[torch.Tensor] = None):
         detector_dtype = next(self.detector.parameters()).dtype
         v = v.mean(1, True).to(dtype=detector_dtype)
         i = i.to(dtype=detector_dtype)
@@ -556,8 +762,8 @@ class KeyNetLoss(nn.Module):
         ri = self._normalize_map(ri)
         rf = self._normalize_map(rf)
 
-        vis_term = F.l1_loss(rf, rv)
-        ir_term = F.l1_loss(rf, ri)
+        vis_term = self._masked_l1(rf, rv, valid_mask)
+        ir_term = self._masked_l1(rf, ri, valid_mask)
         return (self.w_vis * vis_term) + (self.w_ir * ir_term)
 
 
@@ -592,6 +798,7 @@ class Loss(nn.Module):
         w_vis_luma: float = 1.25,
         w_ir_luma: float = 0.80,
         w_vis_contrast: float = 0.85,
+        w_union: float = 0.6,
     ):
         super().__init__()
         self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
@@ -605,23 +812,52 @@ class Loss(nn.Module):
         self.w_vis_luma = w_vis_luma
         self.w_ir_luma = w_ir_luma
         self.w_vis_contrast = w_vis_contrast
+        self.w_union = w_union
 
-    def forward(self, v, i, gt, f, ir_priority=None):
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if valid_mask is None:
+            return x.mean()
+        if valid_mask.shape[-2:] != x.shape[-2:]:
+            valid_mask = F.interpolate(valid_mask, size=x.shape[-2:], mode="nearest")
+        valid_mask = valid_mask.to(dtype=x.dtype)
+        denom = valid_mask.sum().clamp_min(1.0)
+        return (x * valid_mask).sum() / denom
+
+    @staticmethod
+    def _union_keypoint_l1(
+        v: torch.Tensor, i: torch.Tensor, f: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Encourage fused map to preserve keypoints present in either source."""
+        vis_y = rgb_to_luma(v)
+        fused_y = rgb_to_luma(f)
+        vis_grad = normalize_map_per_sample(gradient_mag_map(vis_y))
+        ir_grad = normalize_map_per_sample(gradient_mag_map(i))
+        fused_grad = normalize_map_per_sample(gradient_mag_map(fused_y))
+        union_src = torch.maximum(vis_grad, ir_grad)
+        return Loss._masked_mean((fused_grad - union_src).abs(), valid_mask)
+
+    def forward(self, v, i, gt, f, ir_priority=None, valid_mask: Optional[torch.Tensor] = None):
         if ir_priority is None:
             ir_priority = torch.full_like(i, 0.5)
         vis_priority = 1.0 - ir_priority
 
         src_target = torch.max(v, i.repeat(1, 3, 1, 1))
-        gt_l1 = F.l1_loss(f, gt)
-        src_l1 = F.l1_loss(f, src_target)
+        gt_l1 = self._masked_mean((f - gt).abs(), valid_mask)
+        src_l1 = self._masked_mean((f - src_target).abs(), valid_mask)
 
         ssim_term = K.losses.ssim_loss(f, gt, window_size=11)
-        if ssim_term.ndim > 0:
+        if ssim_term.ndim >= 4:
+            ssim_term = self._masked_mean(ssim_term, valid_mask)
+        elif ssim_term.ndim > 0:
             ssim_term = ssim_term.mean()
 
-        grad_term = F.l1_loss(
-            self.sobel(f.mean(1, True)),
-            self.sobel(gt.mean(1, True)),
+        grad_term = self._masked_mean(
+            (
+                self.sobel(f.mean(1, True))
+                - self.sobel(gt.mean(1, True))
+            ).abs(),
+            valid_mask,
         )
         gt_term = (
             (self.w_gt_l1 * gt_l1)
@@ -631,22 +867,71 @@ class Loss(nn.Module):
 
         fused_y = rgb_to_luma(f)
         vis_y = rgb_to_luma(v)
-        vis_luma_term = (vis_priority * (fused_y - vis_y).abs()).mean()
-        ir_luma_term = (ir_priority * (fused_y - i).abs()).mean()
+        vis_luma_term = self._masked_mean(vis_priority * (fused_y - vis_y).abs(), valid_mask)
+        ir_luma_term = self._masked_mean(ir_priority * (fused_y - i).abs(), valid_mask)
 
         fused_contrast = local_contrast_map(fused_y, kernel_size=5)
         vis_contrast = local_contrast_map(vis_y, kernel_size=5)
-        vis_contrast_term = (vis_priority * (fused_contrast - vis_contrast).abs()).mean()
+        vis_contrast_term = self._masked_mean(
+            vis_priority * (fused_contrast - vis_contrast).abs(), valid_mask
+        )
+        union_term = self._union_keypoint_l1(v, i, f, valid_mask=valid_mask)
 
-        sp_term = self.sp(v, i, f)
+        sp_term = self.sp(v, i, f, valid_mask=valid_mask)
         return (
             self.gt_anchor * gt_term
             + self.w_src_l1 * src_l1
             + self.w_vis_luma * vis_luma_term
             + self.w_ir_luma * ir_luma_term
             + self.w_vis_contrast * vis_contrast_term
+            + self.w_union * union_term
             + self.w_sp * sp_term
         )
+
+
+class UnionKeypointCoverageLoss(nn.Module):
+    """Encourage fused map to cover both VIS and IR salient keypoints."""
+
+    def __init__(self, topk: int = 180, tolerance_px: int = 3):
+        super().__init__()
+        self.topk = topk
+        self.tolerance_px = tolerance_px
+
+    def forward(self, rv: torch.Tensor, ri: torch.Tensor, rf: torch.Tensor) -> torch.Tensor:
+        if rf.shape[-2:] != rv.shape[-2:]:
+            rf = F.interpolate(rf, size=rv.shape[-2:], mode="bilinear", align_corners=False)
+
+        bsz, ch, h, w = rv.shape
+        rv_flat = rv.flatten(1)
+        ri_flat = ri.flatten(1)
+        rf_flat = rf.flatten(1)
+        k = min(self.topk, rv_flat.shape[1], ri_flat.shape[1], rf_flat.shape[1])
+        if k < 1:
+            raise ValueError("UnionKeypointCoverageLoss requires topk >= 1")
+
+        rv_idx = rv_flat.topk(k=k, dim=1).indices
+        ri_idx = ri_flat.topk(k=k, dim=1).indices
+        rf_idx = rf_flat.topk(k=min(2 * k, rf_flat.shape[1]), dim=1).indices
+
+        src_mask = torch.zeros_like(rv_flat, dtype=torch.float32)
+        src_mask.scatter_(1, rv_idx, 1.0)
+        src_mask.scatter_(1, ri_idx, 1.0)
+        src_mask = (src_mask > 0).float().view(bsz, ch, h, w)
+
+        fused_mask = torch.zeros_like(rf_flat, dtype=torch.float32)
+        fused_mask.scatter_(1, rf_idx, 1.0)
+        fused_mask = fused_mask.view(bsz, ch, h, w)
+
+        if self.tolerance_px > 0:
+            kernel = (2 * self.tolerance_px) + 1
+            fused_mask = F.max_pool2d(
+                fused_mask, kernel_size=kernel, stride=1, padding=self.tolerance_px
+            )
+
+        cover = (src_mask * (fused_mask > 0).float()).flatten(1).sum(dim=1)
+        denom = src_mask.flatten(1).sum(dim=1).clamp_min(1.0)
+        coverage = cover / denom
+        return (1.0 - coverage).mean()
 
 
 # =========================================================
@@ -737,7 +1022,11 @@ def evaluate_keypoint_retention(
     sum_ir = 0.0
     n = 0
 
-    for bi, (v, i, _gt) in enumerate(loader):
+    for bi, batch in enumerate(loader):
+        if len(batch) == 4:
+            v, i, _gt, _mask = batch
+        else:
+            v, i, _gt = batch
         if max_batches > 0 and bi >= max_batches:
             break
 
@@ -807,6 +1096,9 @@ def make_loaders(
     val_ratio,
     test_ratio,
     train_aug=True,
+    native_res_train=False,
+    pad_multiple=8,
+    max_train_side=0,
     photo_aug=True,
     vis_brightness_jitter=0.20,
     vis_contrast_jitter=0.20,
@@ -832,6 +1124,8 @@ def make_loaders(
         samples,
         size=size,
         augment=train_aug,
+        native_res=native_res_train,
+        max_side=max_train_side,
         photometric_aug=photo_aug,
         vis_brightness_jitter=vis_brightness_jitter,
         vis_contrast_jitter=vis_contrast_jitter,
@@ -844,6 +1138,12 @@ def make_loaders(
     vl_ds = FusionDataset(samples, size=size, augment=False, indices=vl_ids)
     te_ds = FusionDataset(samples, size=size, augment=False, indices=te_ids)
 
+    tr_collate = (
+        partial(native_pad_collate, pad_multiple=pad_multiple)
+        if native_res_train
+        else None
+    )
+
     pin = torch.cuda.is_available()
     tr_loader = DataLoader(
         tr_ds,
@@ -852,6 +1152,7 @@ def make_loaders(
         num_workers=workers,
         pin_memory=pin,
         persistent_workers=workers > 0,
+        collate_fn=tr_collate,
     )
     vl_loader = DataLoader(
         vl_ds,
@@ -911,7 +1212,10 @@ def save_epoch_previews(
     sample_idx = 0
     for batch in loader:
         if include_gt:
-            v, i, gt = batch
+            if len(batch) == 4:
+                v, i, gt, _mask = batch
+            else:
+                v, i, gt = batch
             names = None
         else:
             v, i, names = batch
@@ -965,6 +1269,109 @@ def save_epoch_previews(
     )
 
 
+def _predict_with_multi_view(
+    net,
+    detector,
+    v,
+    i,
+    args,
+    autocast_dev: str,
+    use_amp: bool,
+):
+    """Average predictions across multiple photometric views for richer supervision."""
+    views = max(1, args.train_views)
+    preds = []
+    ir_priors = []
+    for view_idx in range(views):
+        if view_idx == 0:
+            vv, ii = v, i
+        else:
+            # Apply lightweight tensor-domain photometric variation per extra view.
+            vv = apply_tensor_photometric(
+                v,
+                brightness_jitter=args.vis_brightness_jitter,
+                contrast_jitter=args.vis_contrast_jitter,
+            )
+            ii = apply_tensor_photometric(
+                i,
+                brightness_jitter=args.ir_brightness_jitter,
+                contrast_jitter=args.ir_contrast_jitter,
+            )
+        with torch.amp.autocast(autocast_dev, enabled=use_amp):
+            vis_kmap, ir_kmap = compute_keypoint_maps(vv, ii, detector)
+            pred, aux = net(vv, ii, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
+        preds.append(pred)
+        ir_priors.append(aux["ir_priority"])
+
+    pred_mean = torch.stack(preds, dim=0).mean(dim=0)
+    ir_priority_mean = torch.stack(ir_priors, dim=0).mean(dim=0)
+    return pred_mean, ir_priority_mean
+
+
+def _resolve_view_weights(n_views: int, raw_weights: Sequence[float]) -> List[float]:
+    if n_views < 1:
+        return [1.0]
+    if not raw_weights:
+        return [1.0] + [0.7] * (n_views - 1)
+    ww = [max(0.0, float(x)) for x in raw_weights[:n_views]]
+    if len(ww) < n_views:
+        ww.extend([ww[-1] if ww else 1.0] * (n_views - len(ww)))
+    s = sum(ww)
+    if s <= 1e-8:
+        return [1.0 / n_views] * n_views
+    return [w / s for w in ww]
+
+
+def _train_forward_multi_view(
+    net,
+    detector,
+    loss_fn,
+    v,
+    i,
+    gt,
+    args,
+    autocast_dev: str,
+    use_amp: bool,
+):
+    views = max(1, args.train_views)
+    weights = _resolve_view_weights(views, args.view_loss_weights)
+    total_loss = 0.0
+    ir_priority_acc = None
+    for view_idx in range(views):
+        if view_idx == 0:
+            vv, ii = v, i
+        else:
+            vv = apply_tensor_photometric(
+                v,
+                brightness_jitter=args.vis_brightness_jitter,
+                contrast_jitter=args.vis_contrast_jitter,
+            )
+            ii = apply_tensor_photometric(
+                i,
+                brightness_jitter=args.ir_brightness_jitter,
+                contrast_jitter=args.ir_contrast_jitter,
+            )
+
+            if args.view_prefix_mix > 0:
+                mix = min(1.0, max(0.0, args.view_prefix_mix))
+                vv = ((1.0 - mix) * vv) + (mix * v)
+                ii = ((1.0 - mix) * ii) + (mix * i)
+
+        with torch.amp.autocast(autocast_dev, enabled=use_amp):
+            vis_kmap, ir_kmap = compute_keypoint_maps(vv, ii, detector)
+            pred, aux = net(vv, ii, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
+            this_loss = loss_fn(v, i, gt, pred, ir_priority=aux["ir_priority"])
+        total_loss = total_loss + (weights[view_idx] * this_loss)
+
+        if ir_priority_acc is None:
+            ir_priority_acc = aux["ir_priority"].detach()
+        else:
+            ir_priority_acc = ir_priority_acc + aux["ir_priority"].detach()
+
+    ir_priority_mean = ir_priority_acc / float(views)
+    return total_loss, ir_priority_mean
+
+
 def train(args):
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -984,6 +1391,9 @@ def train(args):
         args.val_ratio,
         args.test_ratio,
         args.train_aug,
+        args.native_res_train,
+        args.pad_multiple,
+        args.max_train_side,
         args.photo_aug,
         args.vis_brightness_jitter,
         args.vis_contrast_jitter,
@@ -992,6 +1402,11 @@ def train(args):
         args.gt_brightness_jitter,
         args.gt_contrast_jitter,
     )
+    if args.native_res_train:
+        print(
+            "Native-resolution train mode: enabled | "
+            f"pad_multiple={args.pad_multiple} max_train_side={args.max_train_side}"
+        )
     print(
         f"Matched samples: {n_samples} | "
         f"train: {n_train} ({len(tr_loader)} batches) | "
@@ -1008,6 +1423,10 @@ def train(args):
         attn_heads=args.attn_heads,
         attn_sr=args.attn_sr,
         attn_depth=args.attn_depth,
+        attn_sr_l3=args.attn_sr_l3,
+        attn_sr_l4=args.attn_sr_l4,
+        attn_depth_l3=args.attn_depth_l3,
+        attn_depth_l4=args.attn_depth_l4,
         attn_mlp_ratio=args.attn_mlp_ratio,
         gate_alpha_vis=args.gate_alpha_vis,
         gate_alpha_ir=args.gate_alpha_ir,
@@ -1041,6 +1460,7 @@ def train(args):
         w_vis_luma=args.w_vis_luma,
         w_ir_luma=args.w_ir_luma,
         w_vis_contrast=args.w_vis_contrast,
+        w_union=args.w_sp_union,
     ).to(device)
     loss_fn.sp.eval()
     opt = torch.optim.AdamW(
@@ -1080,16 +1500,29 @@ def train(args):
         tl = 0.0
         train_ir_priority = 0.0
         train_ir_takeover = 0.0
-        for v, i, gt in tr_loader:
+        for batch in tr_loader:
+            if len(batch) == 4:
+                v, i, gt, valid_mask = batch
+            else:
+                v, i, gt = batch
+                valid_mask = None
             v = v.to(device, non_blocking=True)
             i = i.to(device, non_blocking=True)
             gt = gt.to(device, non_blocking=True)
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(autocast_dev, enabled=use_amp):
-                vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
-                f, aux = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
-                loss = loss_fn(v, i, gt, f, ir_priority=aux["ir_priority"])
+            f, ir_priority = _predict_with_multi_view(
+                net=net,
+                detector=loss_fn.sp.detector,
+                v=v,
+                i=i,
+                args=args,
+                autocast_dev=autocast_dev,
+                use_amp=use_amp,
+            )
+            loss = loss_fn(v, i, gt, f, ir_priority=ir_priority, valid_mask=valid_mask)
 
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -1098,24 +1531,37 @@ def train(args):
             scaler.step(opt)
             scaler.update()
             tl += loss.item()
-            train_ir_priority += aux["ir_priority"].mean().item()
-            train_ir_takeover += (aux["ir_priority"] > 0.5).float().mean().item()
+            train_ir_priority += ir_priority.mean().item()
+            train_ir_takeover += (ir_priority > 0.5).float().mean().item()
 
         net.eval()
         vloss = 0.0
         val_ir_priority = 0.0
         val_ir_takeover = 0.0
         with torch.no_grad():
-            for v, i, gt in vl_loader:
+            for batch in vl_loader:
+                if len(batch) == 4:
+                    v, i, gt, valid_mask = batch
+                else:
+                    v, i, gt = batch
+                    valid_mask = None
                 v = v.to(device, non_blocking=True)
                 i = i.to(device, non_blocking=True)
                 gt = gt.to(device, non_blocking=True)
-                with torch.amp.autocast(autocast_dev, enabled=use_amp):
-                    vis_kmap, ir_kmap = compute_keypoint_maps(v, i, loss_fn.sp.detector)
-                    pred, aux = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
-                    vloss += loss_fn(v, i, gt, pred, ir_priority=aux["ir_priority"]).item()
-                val_ir_priority += aux["ir_priority"].mean().item()
-                val_ir_takeover += (aux["ir_priority"] > 0.5).float().mean().item()
+                if valid_mask is not None:
+                    valid_mask = valid_mask.to(device, non_blocking=True)
+                pred, ir_priority = _predict_with_multi_view(
+                    net=net,
+                    detector=loss_fn.sp.detector,
+                    v=v,
+                    i=i,
+                    args=args,
+                    autocast_dev=autocast_dev,
+                    use_amp=use_amp,
+                )
+                vloss += loss_fn(v, i, gt, pred, ir_priority=ir_priority, valid_mask=valid_mask).item()
+                val_ir_priority += ir_priority.mean().item()
+                val_ir_takeover += (ir_priority > 0.5).float().mean().item()
 
         tl /= max(1, len(tr_loader))
         vloss /= max(1, len(vl_loader))
@@ -1279,7 +1725,7 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--lr-decay", type=float, default=0.5)
-    p.add_argument("--lr-patience", type=int, default=3)
+    p.add_argument("--lr-patience", type=int, default=10)
     p.add_argument("--min-lr", type=float, default=1e-6)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -1301,7 +1747,7 @@ def parse_args():
         help="Max batches for per-epoch retention eval (-1 for full split).",
     )
     p.add_argument("--retention-target-vis", type=float, default=0.62)
-    p.add_argument("--retention-target-ir", type=float, default=0.20)
+    p.add_argument("--retention-target-ir", type=float, default=0.30)
     p.add_argument(
         "--retention-vis-floor",
         type=float,
@@ -1365,13 +1811,13 @@ def parse_args():
     p.add_argument(
         "--vloss-guard-patience",
         type=int,
-        default=3,
+        default=10,
         help="Consecutive epochs of rising VL before adaptation is damped.",
     )
     p.add_argument(
         "--vloss-guard-tol",
         type=float,
-        default=0.0015,
+        default=0.005,
         help="Minimum VL increase to count toward loss guard.",
     )
     p.add_argument(
@@ -1411,6 +1857,24 @@ def parse_args():
         help="Multiplicative source-L1 boost factor when ir_push is active.",
     )
     p.add_argument(
+        "--ir-bias-step",
+        type=float,
+        default=0.02,
+        help="Step size for adaptive IR-bias offset updates.",
+    )
+    p.add_argument(
+        "--ir-bias-min",
+        type=float,
+        default=-0.15,
+        help="Lower bound for adaptive IR-bias offset.",
+    )
+    p.add_argument(
+        "--ir-bias-max",
+        type=float,
+        default=0.45,
+        help="Upper bound for adaptive IR-bias offset.",
+    )
+    p.add_argument(
         "--loss-guard-sp-damp",
         type=float,
         default=0.5,
@@ -1422,6 +1886,50 @@ def parse_args():
     p.add_argument("--photo-aug", dest="photo_aug", action="store_true")
     p.add_argument("--no-photo-aug", dest="photo_aug", action="store_false")
     p.set_defaults(photo_aug=True)
+    p.add_argument(
+        "--native-res-train",
+        dest="native_res_train",
+        action="store_true",
+        help="Train on native image resolutions with batch padding.",
+    )
+    p.add_argument(
+        "--no-native-res-train",
+        dest="native_res_train",
+        action="store_false",
+        help="Disable native-resolution mode and force --size resize.",
+    )
+    p.set_defaults(native_res_train=False)
+    p.add_argument(
+        "--pad-multiple",
+        type=int,
+        default=8,
+        help="Pad native-resolution train batches to a spatial multiple (<=1 disables rounding).",
+    )
+    p.add_argument(
+        "--max-train-side",
+        type=int,
+        default=0,
+        help="Optional cap for native train samples: resize longest side to this value (0 disables cap).",
+    )
+    p.add_argument(
+        "--train-views",
+        type=int,
+        default=2,
+        help="Number of photometric views per train sample to increase diversity and GPU usage.",
+    )
+    p.add_argument(
+        "--view-loss-weights",
+        nargs="*",
+        type=float,
+        default=[1.0, 0.7],
+        help="Optional per-view loss weights (length should match --train-views).",
+    )
+    p.add_argument(
+        "--view-prefix-mix",
+        type=float,
+        default=0.25,
+        help="How much each extra view can mix with previous view output (0-1).",
+    )
     p.add_argument(
         "--vis-brightness-jitter",
         type=float,
@@ -1458,6 +1966,12 @@ def parse_args():
         default=0.10,
         help="Train-only GT contrast jitter range (factor in [1-j, 1+j]).",
     )
+    p.add_argument(
+        "--w-sp-union",
+        type=float,
+        default=0.6,
+        help="Weight of union branch in KeyNet loss: Lf vs max(Lv, Li).",
+    )
     # Rebalanced defaults after switching SSIM/gradient supervision to GT.
     p.add_argument("--w-gt-l1", type=float, default=1.0)
     p.add_argument("--w-ssim", type=float, default=0.9)
@@ -1465,7 +1979,7 @@ def parse_args():
     p.add_argument(
         "--gt-anchor",
         type=float,
-        default=0.08,
+        default=0.02,
         help="Scales total GT supervision so GT acts as a loose reference.",
     )
     p.add_argument("--w-src-l1", type=float, default=0.25)
@@ -1505,7 +2019,7 @@ def parse_args():
         help="Decay rate for w_sp toward baseline when IR push is not allowed.",
     )
     p.add_argument("--sp-vis-weight", type=float, default=1.0)
-    p.add_argument("--sp-ir-weight", type=float, default=2.0)
+    p.add_argument("--sp-ir-weight", type=float, default=3.0)
     p.add_argument("--sp-ir-weight-max", type=float, default=3.0)
     p.add_argument(
         "--sp-ir-decay",
@@ -1519,6 +2033,30 @@ def parse_args():
     p.add_argument("--attn-heads", type=int, default=16)
     p.add_argument("--attn-sr", type=int, default=4)
     p.add_argument("--attn-depth", type=int, default=3)
+    p.add_argument(
+        "--attn-sr-l3",
+        type=int,
+        default=1,
+        help="Spatial-reduction ratio for Layer-3 multi-scale fusion attention.",
+    )
+    p.add_argument(
+        "--attn-sr-l4",
+        type=int,
+        default=2,
+        help="Spatial-reduction ratio for Layer-4 multi-scale fusion attention.",
+    )
+    p.add_argument(
+        "--attn-depth-l3",
+        type=int,
+        default=1,
+        help="Number of FusionTokenBlocks applied at Layer-3 features.",
+    )
+    p.add_argument(
+        "--attn-depth-l4",
+        type=int,
+        default=1,
+        help="Number of FusionTokenBlocks applied at Layer-4 features.",
+    )
     p.add_argument("--attn-mlp-ratio", type=float, default=2.0)
     p.add_argument(
         "--gate-alpha-vis",
@@ -1674,6 +2212,24 @@ if __name__ == "__main__":
         raise ValueError("--luma-pred-mix must be in [0, 1]")
     if not (0.0 <= args.pred_rgb_mix <= 1.0):
         raise ValueError("--pred-rgb-mix must be in [0, 1]")
+    if args.attn_depth < 0:
+        raise ValueError("--attn-depth must be >= 0")
+    if args.attn_depth_l3 < 0:
+        raise ValueError("--attn-depth-l3 must be >= 0")
+    if args.attn_depth_l4 < 0:
+        raise ValueError("--attn-depth-l4 must be >= 0")
+    if args.attn_sr < 1:
+        raise ValueError("--attn-sr must be >= 1")
+    if args.attn_sr_l3 < 1:
+        raise ValueError("--attn-sr-l3 must be >= 1")
+    if args.attn_sr_l4 < 1:
+        raise ValueError("--attn-sr-l4 must be >= 1")
+    if args.pad_multiple < 0:
+        raise ValueError("--pad-multiple must be >= 0")
+    if args.max_train_side < 0:
+        raise ValueError("--max-train-side must be >= 0")
+    if args.native_res_train and args.pad_multiple == 0:
+        raise ValueError("--pad-multiple must be >= 1 when --native-res-train is enabled")
     for req_path in [args.vis_dir, args.ir_dir, args.gt_dir]:
         if not os.path.isdir(req_path):
             raise FileNotFoundError(f"Missing directory: {req_path}")
