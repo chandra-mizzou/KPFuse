@@ -840,23 +840,13 @@ def evaluate_keypoint_retention(net, detector, loader, device, use_amp, topk: in
     net.eval()
     detector.eval()
     detector_dtype = next(detector.parameters()).dtype
-    vis_sum = 0.0
-    ir_sum = 0.0
-    n = 0
-    for batch in loader:
-        if len(batch) == 4:
-            v, i, _gt, _mask = batch
-        else:
-            v, i, _gt = batch
-        v = v.to(device, non_blocking=True)
-        i = i.to(device, non_blocking=True)
-        with torch.amp.autocast(autocast_dev, enabled=use_amp):
-            vis_kmap, ir_kmap = compute_keypoint_maps(v, i, detector)
-            f = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap)
-        fg = f.mean(1, True).to(dtype=detector_dtype)
-        rv = vis_kmap.to(dtype=detector_dtype)
-        ri = ir_kmap.to(dtype=detector_dtype)
-        rf = normalize_map_per_sample(detector(fg))
+    branch_acc = {
+        "VISdom": {"vis": 0.0, "ir": 0.0},
+        "IRdom": {"vis": 0.0, "ir": 0.0},
+        "EXCL": {"vis": 0.0, "ir": 0.0},
+    }
+
+    def _branch_retention(rv: torch.Tensor, ri: torch.Tensor, rf: torch.Tensor):
         rvf = rv.flatten(1)
         rif = ri.flatten(1)
         rff = rf.flatten(1)
@@ -872,14 +862,47 @@ def evaluate_keypoint_retention(net, detector, loader, device, use_amp, topk: in
         fused_mask.scatter_(1, fused_idx, 1.0)
         vis_ret = (vis_mask * fused_mask).sum(dim=1) / vis_mask.sum(dim=1).clamp_min(1.0)
         ir_ret = (ir_mask * fused_mask).sum(dim=1) / ir_mask.sum(dim=1).clamp_min(1.0)
-        vis_sum += vis_ret.sum().item()
-        ir_sum += ir_ret.sum().item()
+        return vis_ret, ir_ret
+
+    n = 0
+    for batch in loader:
+        if len(batch) == 4:
+            v, i, _gt, _mask = batch
+        else:
+            v, i, _gt = batch
+        v = v.to(device, non_blocking=True)
+        i = i.to(device, non_blocking=True)
+        with torch.amp.autocast(autocast_dev, enabled=use_amp):
+            vis_kmap, ir_kmap = compute_keypoint_maps(v, i, detector)
+            _, aux = net(v, i, vis_kmap=vis_kmap, ir_kmap=ir_kmap, return_aux=True)
+        rv = vis_kmap.to(dtype=detector_dtype)
+        ri = ir_kmap.to(dtype=detector_dtype)
+
+        for branch_name, fused_key in (
+            ("VISdom", "fused_vis"),
+            ("IRdom", "fused_ir"),
+            ("EXCL", "fused_excl"),
+        ):
+            fg = aux[fused_key].mean(1, True).to(dtype=detector_dtype)
+            rf = normalize_map_per_sample(detector(fg))
+            vis_ret, ir_ret = _branch_retention(rv, ri, rf)
+            branch_acc[branch_name]["vis"] += vis_ret.sum().item()
+            branch_acc[branch_name]["ir"] += ir_ret.sum().item()
         n += v.shape[0]
+
     if n == 0:
-        return 0.0, 0.0, 0.0
-    vis_score = vis_sum / n
-    ir_score = ir_sum / n
-    return vis_score, ir_score, 0.5 * (vis_score + ir_score)
+        return {
+            "VISdom": (0.0, 0.0, 0.0),
+            "IRdom": (0.0, 0.0, 0.0),
+            "EXCL": (0.0, 0.0, 0.0),
+        }
+
+    out = {}
+    for branch_name in ("VISdom", "IRdom", "EXCL"):
+        vis_score = branch_acc[branch_name]["vis"] / n
+        ir_score = branch_acc[branch_name]["ir"] / n
+        out[branch_name] = (vis_score, ir_score, 0.5 * (vis_score + ir_score))
+    return out
 
 
 def _resolve_view_weights(n_views: int, raw_weights: Sequence[float]) -> List[float]:
@@ -1124,7 +1147,7 @@ def train(args):
         tl /= max(1, len(tr_loader))
         vl /= max(1, len(vl_loader))
         scheduler.step(vl)
-        vis_ret, ir_ret, mean_ret = evaluate_keypoint_retention(
+        ret_stats = evaluate_keypoint_retention(
             net=net,
             detector=loss_fn.sp.detector,
             loader=te_loader if args.retention_split == "test" else vl_loader,
@@ -1132,10 +1155,22 @@ def train(args):
             use_amp=use_amp,
             topk=args.retention_topk,
         )
+        vis_ret, ir_ret, mean_ret = ret_stats["EXCL"]
         print(
             f"Epoch {e + 1}/{args.epochs} | TL={tl:.4f} VL={vl:.4f} "
-            f"| Ret(vis={vis_ret:.4f}, ir={ir_ret:.4f}, mean={mean_ret:.4f}) "
+            f"| Ret_EXCL(vis={vis_ret:.4f}, ir={ir_ret:.4f}, mean={mean_ret:.4f}) "
             f"| LR={opt.param_groups[0]['lr']:.2e}"
+        )
+        r_visdom = ret_stats["VISdom"]
+        r_irdom = ret_stats["IRdom"]
+        print(
+            f"Ret_VISdom(vis->fused={r_visdom[0]:.4f}, ir->fused={r_visdom[1]:.4f}, mean={r_visdom[2]:.4f})"
+        )
+        print(
+            f"Ret_IRdom(vis->fused={r_irdom[0]:.4f}, ir->fused={r_irdom[1]:.4f}, mean={r_irdom[2]:.4f})"
+        )
+        print(
+            f"Ret_EXCL(vis->fused={vis_ret:.4f}, ir->fused={ir_ret:.4f}, mean={mean_ret:.4f})"
         )
 
         if vl < best:
