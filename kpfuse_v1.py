@@ -1725,7 +1725,7 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--lr-decay", type=float, default=0.5)
-    p.add_argument("--lr-patience", type=int, default=3)
+    p.add_argument("--lr-patience", type=int, default=10)
     p.add_argument("--min-lr", type=float, default=1e-6)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -1747,7 +1747,7 @@ def parse_args():
         help="Max batches for per-epoch retention eval (-1 for full split).",
     )
     p.add_argument("--retention-target-vis", type=float, default=0.62)
-    p.add_argument("--retention-target-ir", type=float, default=0.20)
+    p.add_argument("--retention-target-ir", type=float, default=0.30)
     p.add_argument(
         "--retention-vis-floor",
         type=float,
@@ -1811,13 +1811,13 @@ def parse_args():
     p.add_argument(
         "--vloss-guard-patience",
         type=int,
-        default=3,
+        default=10,
         help="Consecutive epochs of rising VL before adaptation is damped.",
     )
     p.add_argument(
         "--vloss-guard-tol",
         type=float,
-        default=0.0015,
+        default=0.005,
         help="Minimum VL increase to count toward loss guard.",
     )
     p.add_argument(
@@ -1979,7 +1979,7 @@ def parse_args():
     p.add_argument(
         "--gt-anchor",
         type=float,
-        default=0.08,
+        default=0.02,
         help="Scales total GT supervision so GT acts as a loose reference.",
     )
     p.add_argument("--w-src-l1", type=float, default=0.25)
@@ -2019,7 +2019,7 @@ def parse_args():
         help="Decay rate for w_sp toward baseline when IR push is not allowed.",
     )
     p.add_argument("--sp-vis-weight", type=float, default=1.0)
-    p.add_argument("--sp-ir-weight", type=float, default=2.0)
+    p.add_argument("--sp-ir-weight", type=float, default=3.0)
     p.add_argument("--sp-ir-weight-max", type=float, default=3.0)
     p.add_argument(
         "--sp-ir-decay",
