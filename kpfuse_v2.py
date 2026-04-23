@@ -757,11 +757,12 @@ class KeyNetResponse(nn.Module):
 
 
 class KeyNetLoss(nn.Module):
-    def __init__(self, vis_weight: float = 1.0, ir_weight: float = 2.0):
+    def __init__(self, vis_weight: float = 1.0, ir_weight: float = 2.0, detector_max_side: int = 256):
         super().__init__()
         self.detector = KeyNetResponse()
         self.w_vis = vis_weight
         self.w_ir = ir_weight
+        self.detector_max_side = int(detector_max_side)
 
     @staticmethod
     def _normalize_map(x: torch.Tensor) -> torch.Tensor:
@@ -780,11 +781,26 @@ class KeyNetLoss(nn.Module):
         denom = valid_mask.sum().clamp_min(1.0)
         return (diff * valid_mask).sum() / denom
 
+    def _resize_for_detector(self, x: torch.Tensor) -> torch.Tensor:
+        if self.detector_max_side <= 0:
+            return x
+        h, w = x.shape[-2:]
+        long_side = max(h, w)
+        if long_side <= self.detector_max_side:
+            return x
+        scale = self.detector_max_side / float(long_side)
+        new_h = max(8, int(round(h * scale)))
+        new_w = max(8, int(round(w * scale)))
+        return F.interpolate(x, size=(new_h, new_w), mode="bilinear", align_corners=False)
+
     def forward(self, v, i, f, valid_mask: Optional[torch.Tensor] = None):
         detector_dtype = next(self.detector.parameters()).dtype
         v = v.mean(1, True).to(dtype=detector_dtype)
         i = i.to(dtype=detector_dtype)
         f = f.mean(1, True).to(dtype=detector_dtype)
+        v = self._resize_for_detector(v)
+        i = self._resize_for_detector(i)
+        f = self._resize_for_detector(f)
         with torch.no_grad():
             rv = self.detector(v)
             ri = self.detector(i)
@@ -829,9 +845,14 @@ class Loss(nn.Module):
         w_ir_luma: float = 0.80,
         w_vis_contrast: float = 0.85,
         w_union: float = 0.6,
+        sp_detector_max_side: int = 256,
     ):
         super().__init__()
-        self.sp = KeyNetLoss(vis_weight=sp_vis_weight, ir_weight=sp_ir_weight)
+        self.sp = KeyNetLoss(
+            vis_weight=sp_vis_weight,
+            ir_weight=sp_ir_weight,
+            detector_max_side=sp_detector_max_side,
+        )
         self.sobel = SobelGrad()
         self.w_gt_l1 = w_gt_l1
         self.w_ssim = w_ssim
@@ -866,7 +887,16 @@ class Loss(nn.Module):
         union_src = torch.maximum(vis_grad, ir_grad)
         return Loss._masked_mean((fused_grad - union_src).abs(), valid_mask)
 
-    def forward(self, v, i, gt, f, ir_priority=None, valid_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        v,
+        i,
+        gt,
+        f,
+        ir_priority=None,
+        valid_mask: Optional[torch.Tensor] = None,
+        sp_branch_scale: float = 1.0,
+    ):
         if ir_priority is None:
             ir_priority = torch.full_like(i, 0.5)
         vis_priority = 1.0 - ir_priority
@@ -899,7 +929,10 @@ class Loss(nn.Module):
             valid_mask,
         )
         union_term = self._union_keypoint_l1(v, i, f, valid_mask=valid_mask)
-        sp_term = self.sp(v, i, f, valid_mask=valid_mask)
+        if (self.w_sp > 0.0) and (sp_branch_scale > 0.0):
+            sp_term = self.sp(v, i, f, valid_mask=valid_mask)
+        else:
+            sp_term = torch.zeros((), device=f.device, dtype=f.dtype)
 
         return (
             self.gt_anchor * gt_term
@@ -908,7 +941,7 @@ class Loss(nn.Module):
             + self.w_ir_luma * ir_luma_term
             + self.w_vis_contrast * vis_contrast_term
             + self.w_union * union_term
-            + self.w_sp * sp_term
+            + (self.w_sp * sp_branch_scale * sp_term)
         )
 
 
@@ -1176,6 +1209,7 @@ def train(args):
         w_ir_luma=args.w_ir_luma,
         w_vis_contrast=args.w_vis_contrast,
         w_union=args.w_sp_union,
+        sp_detector_max_side=args.sp_detector_max_side,
     ).to(device)
     loss_fn.sp.eval()
 
@@ -1216,10 +1250,32 @@ def train(args):
                 valid_mask = valid_mask.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
             preds = _predict_with_multi_view(net, loss_fn.sp.detector, v, i, args, autocast_dev, use_amp)
-            loss_vis = loss_fn(v, i, gt, preds["fused_vis"], ir_priority=preds["ir_priority_vis"], valid_mask=valid_mask)
-            loss_ir = loss_fn(v, i, gt, preds["fused_ir"], ir_priority=preds["ir_priority_ir"], valid_mask=valid_mask)
+            loss_vis = loss_fn(
+                v,
+                i,
+                gt,
+                preds["fused_vis"],
+                ir_priority=preds["ir_priority_vis"],
+                valid_mask=valid_mask,
+                sp_branch_scale=args.sp_scale_vis,
+            )
+            loss_ir = loss_fn(
+                v,
+                i,
+                gt,
+                preds["fused_ir"],
+                ir_priority=preds["ir_priority_ir"],
+                valid_mask=valid_mask,
+                sp_branch_scale=args.sp_scale_ir,
+            )
             loss_excl = loss_fn(
-                v, i, gt, preds["fused_excl"], ir_priority=preds["ir_priority_excl"], valid_mask=valid_mask
+                v,
+                i,
+                gt,
+                preds["fused_excl"],
+                ir_priority=preds["ir_priority_excl"],
+                valid_mask=valid_mask,
+                sp_branch_scale=args.sp_scale_excl,
             )
             loss = (lw_vis * loss_vis) + (lw_ir * loss_ir) + (lw_excl * loss_excl)
             scaler.scale(loss).backward()
@@ -1245,10 +1301,32 @@ def train(args):
                 if valid_mask is not None:
                     valid_mask = valid_mask.to(device, non_blocking=True)
                 preds = _predict_with_multi_view(net, loss_fn.sp.detector, v, i, args, autocast_dev, use_amp)
-                lv = loss_fn(v, i, gt, preds["fused_vis"], ir_priority=preds["ir_priority_vis"], valid_mask=valid_mask)
-                li = loss_fn(v, i, gt, preds["fused_ir"], ir_priority=preds["ir_priority_ir"], valid_mask=valid_mask)
+                lv = loss_fn(
+                    v,
+                    i,
+                    gt,
+                    preds["fused_vis"],
+                    ir_priority=preds["ir_priority_vis"],
+                    valid_mask=valid_mask,
+                    sp_branch_scale=args.sp_scale_vis,
+                )
+                li = loss_fn(
+                    v,
+                    i,
+                    gt,
+                    preds["fused_ir"],
+                    ir_priority=preds["ir_priority_ir"],
+                    valid_mask=valid_mask,
+                    sp_branch_scale=args.sp_scale_ir,
+                )
                 le = loss_fn(
-                    v, i, gt, preds["fused_excl"], ir_priority=preds["ir_priority_excl"], valid_mask=valid_mask
+                    v,
+                    i,
+                    gt,
+                    preds["fused_excl"],
+                    ir_priority=preds["ir_priority_excl"],
+                    valid_mask=valid_mask,
+                    sp_branch_scale=args.sp_scale_excl,
                 )
                 vl += (lw_vis * lv + lw_ir * li + lw_excl * le).item()
 
@@ -1399,6 +1477,10 @@ def parse_args():
     p.add_argument("--w-sp", type=float, default=0.08)
     p.add_argument("--sp-vis-weight", type=float, default=1.0)
     p.add_argument("--sp-ir-weight", type=float, default=3.0)
+    p.add_argument("--sp-detector-max-side", type=int, default=256)
+    p.add_argument("--sp-scale-vis", type=float, default=0.0)
+    p.add_argument("--sp-scale-ir", type=float, default=0.0)
+    p.add_argument("--sp-scale-excl", type=float, default=1.0)
 
     p.add_argument("--loss-w-vis", type=float, default=0.25)
     p.add_argument("--loss-w-ir", type=float, default=0.25)
@@ -1430,6 +1512,10 @@ if __name__ == "__main__":
         raise ValueError("--gain-max must be >= --gain-min")
     if not (0.0 <= args.gain_strength <= 1.0):
         raise ValueError("--gain-strength must be in [0, 1]")
+    if args.sp_detector_max_side < 0:
+        raise ValueError("--sp-detector-max-side must be >= 0")
+    if min(args.sp_scale_vis, args.sp_scale_ir, args.sp_scale_excl) < 0:
+        raise ValueError("--sp-scale-vis/--sp-scale-ir/--sp-scale-excl must be >= 0")
     if args.attn_depth_l3 < 0 or args.attn_depth_l4 < 0:
         raise ValueError("--attn-depth-l3/l4 must be >= 0")
     if args.attn_sr_l3 < 1 or args.attn_sr_l4 < 1:
